@@ -247,6 +247,67 @@
             background: #e74c3c;
         }
 
+        .voice-control {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+            margin: 15px 0 5px 0;
+        }
+
+        .voice-transcript {
+            text-align: center;
+            color: white;
+            font-size: 0.95em;
+            margin-bottom: 10px;
+        }
+
+        .voice-transcript span {
+            font-weight: 600;
+            color: #ffeaa7;
+        }
+
+        .wake-word-display {
+            text-align: center;
+            color: #ffeaa7;
+            font-weight: 700;
+            opacity: 0;
+            transition: opacity 2s ease-in-out;
+            margin-bottom: 10px;
+        }
+
+        .wake-word-display.show {
+            opacity: 1;
+        }
+
+        .mic-btn {
+            background: #27ae60;
+            color: white;
+            border: none;
+            border-radius: 30px;
+            padding: 10px 18px;
+            font-size: 1em;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+        }
+
+        .mic-btn:hover {
+            background: #229954;
+            transform: scale(1.03);
+        }
+
+        .mic-btn.listening {
+            background: #e67e22;
+            animation: pulse 1s infinite;
+        }
+
+        .voice-status {
+            color: white;
+            font-size: 0.95em;
+        }
+
         .last-update {
             text-align: center;
             color: white;
@@ -260,6 +321,14 @@
         <div class="header">
             <h1>🏠 Smart Home Control System</h1>
             <p>Hệ thống điều khiển nhà thông minh</p>
+            <div class="voice-control">
+                <button class="mic-btn" id="micButton">🎤 Ra lệnh bằng giọng nói</button>
+                <span class="voice-status" id="voiceStatus">Sẵn sàng</span>
+            </div>
+            <div class="voice-transcript" id="voiceTranscript">
+                Bạn nói: <span>--</span>
+            </div>
+            <div class="wake-word-display" id="wakeWordDisplay"></div>
         </div>
 
         <div class="connection-status disconnected" id="connectionStatus">
@@ -345,7 +414,7 @@
 
             <!-- Fan & Roof Control -->
             <div class="control-panel">
-                <h2>🌀 Điều khiển quạt & Rèm</h2>
+                <h2>🌀 Điều khiển quạt & mái che</h2>
                 <div class="control-item">
                     <label>Quạt</label>
                     <div class="button-group">
@@ -354,7 +423,7 @@
                     </div>
                 </div>
                 <div class="control-item">
-                    <label>Rèm / Mái che</label>
+                    <label>Mái che</label>
                     <div class="button-group">
                         <button class="btn btn-success" onclick="controlRoof(true)">Mở rèm</button>
                         <button class="btn btn-danger" onclick="controlRoof(false)">Đóng rèm</button>
@@ -369,8 +438,47 @@
     </div>
 
     <script>
-        const API_BASE = 'http://localhost:5000';
+        const API_BASE = window.location.origin;
         let updateInterval;
+        let isListening = false;
+        let wakeHideTimeout = null;
+
+        function initVoiceButton() {
+            const micButton = document.getElementById('micButton');
+            const voiceStatus = document.getElementById('voiceStatus');
+            const voiceTranscript = document.getElementById('voiceTranscript');
+
+            micButton.addEventListener('click', async () => {
+                if (isListening) return;
+                isListening = true;
+                micButton.classList.add('listening');
+                micButton.disabled = true;
+                voiceStatus.textContent = 'Đang nghe ở server...';
+                voiceTranscript.innerHTML = 'Bạn nói: <span>--</span>';
+
+                try {
+                    const response = await fetch(`${API_BASE}/voice/once`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+                    const result = await response.json();
+                    if (result && result.text) {
+                        voiceTranscript.innerHTML = `Bạn nói: <span>${result.text}</span>`;
+                    }
+                    if (result && result.success) {
+                        voiceStatus.textContent = `Đã gửi lệnh: ${result.command}`;
+                    } else {
+                        voiceStatus.textContent = result.message || 'Không nhận diện được lệnh';
+                    }
+                } catch (error) {
+                    voiceStatus.textContent = 'Lỗi: ' + error.message;
+                } finally {
+                    isListening = false;
+                    micButton.classList.remove('listening');
+                    micButton.disabled = false;
+                }
+            });
+        }
 
         // Cập nhật dữ liệu từ server
         async function updateData() {
@@ -409,6 +517,10 @@
                 document.getElementById('doorValue').textContent = doorStatus;
                 document.getElementById('doorValue').className = data.door === 'OPEN' ? 'status-value alert' : 'status-value safe';
 
+                const fanStatus = data.fan ? 'BẬT' : 'TẮT';
+                document.getElementById('fanValue').textContent = fanStatus;
+                document.getElementById('fanValue').className = data.fan ? 'status-value alert' : 'status-value safe';
+
                 // Cập nhật đèn
                 document.getElementById('light1Switch').checked = data.light1 || false;
                 document.getElementById('light2Switch').checked = data.light2 || false;
@@ -424,6 +536,45 @@
                 console.error('Error:', error);
                 document.getElementById('connectionStatus').textContent = '✗ Lỗi kết nối';
                 document.getElementById('connectionStatus').className = 'connection-status disconnected';
+            }
+        }
+
+        async function checkWakeWord() {
+            try {
+                const response = await fetch(`${API_BASE}/voice/status`);
+                const data = await response.json();
+                const wakeEl = document.getElementById('wakeWordDisplay');
+                if (data && data.wake_word) {
+                    const text = data.text || 'nhà tôi ơi';
+                    wakeEl.textContent = `🎤 Wake word detected: ${text}`;
+                    wakeEl.classList.add('show');
+                    if (wakeHideTimeout) {
+                        clearTimeout(wakeHideTimeout);
+                        wakeHideTimeout = null;
+                    }
+                } else if (data && data.active) {
+                    if (!wakeEl.textContent) {
+                        wakeEl.textContent = '🎤 Wake word detected: nhà tôi ơi';
+                        wakeEl.classList.add('show');
+                    }
+                }
+
+                if (data && data.response_ready) {
+                    const responseText = data.response_text || '';
+                    if (responseText) {
+                        wakeEl.textContent = `🔊 ${responseText}`;
+                        wakeEl.classList.add('show');
+                    }
+                    if (wakeHideTimeout) {
+                        clearTimeout(wakeHideTimeout);
+                    }
+                    wakeHideTimeout = setTimeout(() => {
+                        wakeEl.classList.remove('show');
+                        wakeEl.textContent = '';
+                    }, 3000);
+                }
+            } catch (error) {
+                // ignore
             }
         }
 
@@ -512,8 +663,10 @@
         }
 
         // Khởi động
+        initVoiceButton();
         updateData();
         updateInterval = setInterval(updateData, 2000); // Cập nhật mỗi 2 giây
+        setInterval(checkWakeWord, 1000);
     </script>
 </body>
 </html>

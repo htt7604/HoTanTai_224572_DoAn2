@@ -4,9 +4,19 @@ from pymongo import MongoClient
 import paho.mqtt.client as mqtt
 import json
 from datetime import datetime, timedelta
+import ssl
 import os
 import threading
 import time
+from ai_engine import SmartHomeAI
+try:
+    import speech_recognition as sr
+except Exception:
+    sr = None
+try:
+    import pyttsx3
+except Exception:
+    pyttsx3 = None
 
 # ================== MONGODB ==================
 mongo = MongoClient("mongodb://localhost:27017/")
@@ -14,25 +24,69 @@ db = mongo["iot_db"]
 collection_sensor = db["sensor_data"]  # Dữ liệu cảm biến định kỳ
 collection_events = db["events"]  # Sự kiện quan trọng
 collection_states = db["device_states"]  # Trạng thái thiết bị
+collection_user_actions = db["user_actions"]  # Lịch sử điều khiển thiết bị
 
 # Tạo index cho truy vấn nhanh hơn
 collection_sensor.create_index("timestamp")
 collection_events.create_index("timestamp")
 collection_events.create_index("event_type")
+collection_user_actions.create_index("timestamp")
 
 print("MongoDB connected")
+
+# ================== AI ENGINE ==================
+ai_engine = SmartHomeAI(db)
 
 # ================== FLASK ==================
 app = Flask(__name__, template_folder='templates')
 CORS(app)  # Cho phép CORS để web app có thể gọi API
 
+# ================== ENV FILE ==================
+ENV_FILE = os.path.join(os.path.dirname(__file__), ".env")
+
+
+def load_env_file(path):
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except Exception as e:
+        print(f"Failed to load env file: {e}")
+
+
+load_env_file(ENV_FILE)
+
 # ================== MQTT ==================
-MQTT_BROKER = "localhost"
+MQTT_BROKER = "3c5308fe02794486932d547731382984.s1.eu.hivemq.cloud"
+MQTT_PORT = 8883
 MQTT_TOPIC_SENSOR = "esp32/sensor"
 MQTT_TOPIC_CONTROL = "esp32/control"
 
 latest_data = {}
 mqtt_client = None
+
+# ================== VOICE CONTROL ==================
+VOICE_ENABLED = os.getenv("VOICE_ENABLED", "1") == "1"
+VOICE_LANGUAGE = os.getenv("VOICE_LANGUAGE", "vi-VN")
+WAKE_WORD = "nhà tôi ơi"
+tts_engine = None
+tts_lock = threading.Lock()
+wake_thread_started = False
+voice_priority_event = threading.Event()
+wake_word_detected = False
+wake_word_text = ""
+wake_session_active = False
+wake_response_ready = False
+wake_response_text = ""
 
 # ================== THEO DÕI TRẠNG THÁI ==================
 # Lưu trạng thái trước đó để phát hiện thay đổi
@@ -50,7 +104,7 @@ previous_state = {
 }
 
 # Thời gian lưu định kỳ
-PERIODIC_SAVE_INTERVAL = 300  # 5 phút (300 giây)
+PERIODIC_SAVE_INTERVAL = 120  # 2 phút (120 giây)
 last_periodic_save = datetime.now()
 
 # Ngưỡng thay đổi để coi là sự kiện quan trọng
@@ -205,13 +259,194 @@ def on_message(client, userdata, msg):
         import traceback
         traceback.print_exc()
 
+def _get_env_value(name):
+    value = os.getenv(name)
+    if value is None:
+        return None
+    value = value.strip().strip('"').strip("'").strip()
+    return value or None
+
+
 def init_mqtt():
     global mqtt_client
-    mqtt_client = mqtt.Client()
+    mqtt_username = _get_env_value("MQTT_USERNAME")
+    mqtt_password = _get_env_value("MQTT_PASSWORD")
+    if not mqtt_username or not mqtt_password:
+        raise RuntimeError("Missing MQTT_USERNAME or MQTT_PASSWORD environment variable")
+    mqtt_client_id = _get_env_value("MQTT_CLIENT_ID") or f"SERVER_{int(time.time())}"
+    mqtt_client = mqtt.Client(client_id=mqtt_client_id)
     mqtt_client.on_connect = on_connect
     mqtt_client.on_message = on_message
-    mqtt_client.connect(MQTT_BROKER, 1883, 60)
+    mqtt_client.username_pw_set(mqtt_username, mqtt_password)
+    mqtt_client.tls_set(tls_version=ssl.PROTOCOL_TLS)
+    mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
     mqtt_client.loop_start()
+
+def log_user_action(command, source, raw_text=None):
+    """Lưu lịch sử hành động của người dùng vào MongoDB"""
+    doc = {
+        "timestamp": datetime.now(),
+        "command": command,
+        "source": source
+    }
+    if raw_text:
+        doc["text"] = raw_text
+    collection_user_actions.insert_one(doc)
+
+def voice_listen_once():
+    """Nghe một lần từ microphone và trả về text."""
+    if sr is None:
+        return None, "speech_recognition not available"
+    recognizer = sr.Recognizer()
+    try:
+        with sr.Microphone() as source:
+            recognizer.adjust_for_ambient_noise(source, duration=0.8)
+            audio = recognizer.listen(source)
+        text = recognizer.recognize_google(audio, language=VOICE_LANGUAGE)
+        return text, None
+    except sr.UnknownValueError:
+        return None, "Không nghe rõ"
+    except sr.RequestError:
+        return None, "Lỗi kết nối Google Speech API"
+    except Exception as e:
+        return None, str(e)
+
+def start_voice_listener():
+    """Giữ hàm rỗng để tương thích (không chạy nền)."""
+    return
+
+
+def describe_command(command):
+    cmd = (command or "").strip().upper()
+    if not cmd:
+        return "Tôi đã thực hiện lệnh"
+    if cmd == "DOOR_OPEN":
+        return "Tôi đã mở cửa"
+    if cmd == "DOOR_CLOSE":
+        return "Tôi đã đóng cửa"
+    if cmd == "FAN_ON":
+        return "Tôi đã bật quạt"
+    if cmd == "FAN_OFF":
+        return "Tôi đã tắt quạt"
+    if cmd == "ROOF_OPEN":
+        return "Tôi đã mở rèm"
+    if cmd == "ROOF_CLOSE":
+        return "Tôi đã đóng rèm"
+    if cmd.startswith("LIGHT") and cmd.endswith("_ON"):
+        light_num = cmd.replace("LIGHT", "").replace("_ON", "")
+        return f"Tôi đã bật đèn {light_num}"
+    if cmd.startswith("LIGHT") and cmd.endswith("_OFF"):
+        light_num = cmd.replace("LIGHT", "").replace("_OFF", "")
+        return f"Tôi đã tắt đèn {light_num}"
+    return f"Tôi đã thực hiện lệnh {cmd}"
+
+
+def speak(text):
+    if not VOICE_ENABLED:
+        return
+    if pyttsx3 is None:
+        return
+    global tts_engine
+    with tts_lock:
+        if tts_engine is None:
+            try:
+                tts_engine = pyttsx3.init()
+            except Exception:
+                tts_engine = None
+                return
+        try:
+            tts_engine.say(text)
+            tts_engine.runAndWait()
+        except Exception:
+            return
+
+
+def listen_for_wake_word():
+    if not VOICE_ENABLED or sr is None:
+        return
+    recognizer = sr.Recognizer()
+    while True:
+        if voice_priority_event.is_set():
+            time.sleep(0.1)
+            continue
+        try:
+            with sr.Microphone() as source:
+                recognizer.adjust_for_ambient_noise(source, duration=0.8)
+                audio = recognizer.listen(source)
+            heard = recognizer.recognize_google(audio, language=VOICE_LANGUAGE)
+        except Exception:
+            continue
+
+        if not heard:
+            continue
+        if WAKE_WORD in heard.strip().lower():
+            global wake_word_detected, wake_word_text
+            global wake_session_active, wake_response_ready, wake_response_text
+            wake_word_detected = True
+            wake_word_text = WAKE_WORD
+            wake_session_active = True
+            wake_response_ready = False
+            wake_response_text = ""
+            speak("Nhà đây bạn cần gì")
+            try:
+                with sr.Microphone() as source:
+                    recognizer.adjust_for_ambient_noise(source, duration=0.6)
+                    cmd_audio = recognizer.listen(source)
+                cmd_text = recognizer.recognize_google(cmd_audio, language=VOICE_LANGUAGE)
+            except Exception:
+                response = "Tôi không hiểu lệnh"
+                speak(response)
+                wake_response_text = response
+                wake_response_ready = True
+                wake_session_active = False
+                continue
+
+            if not cmd_text:
+                response = "Tôi không hiểu lệnh"
+                speak(response)
+                wake_response_text = response
+                wake_response_ready = True
+                wake_session_active = False
+                continue
+
+            command = ai_engine.process_command(cmd_text)
+            if not command:
+                response = "Tôi không hiểu lệnh"
+                speak(response)
+                wake_response_text = response
+                wake_response_ready = True
+                wake_session_active = False
+                continue
+
+            if mqtt_client:
+                result = mqtt_client.publish(MQTT_TOPIC_CONTROL, command)
+                log_user_action(command, "wake_word", raw_text=cmd_text)
+                if getattr(result, "rc", None) == mqtt.MQTT_ERR_SUCCESS:
+                    response = describe_command(command)
+                    speak(response)
+                else:
+                    response = "Tôi chưa gửi được lệnh"
+                    speak(response)
+                wake_response_text = response
+                wake_response_ready = True
+                wake_session_active = False
+            else:
+                response = "MQTT chưa kết nối"
+                speak(response)
+                wake_response_text = response
+                wake_response_ready = True
+                wake_session_active = False
+
+
+def start_wake_word_listener():
+    global wake_thread_started
+    if not VOICE_ENABLED:
+        return
+    if wake_thread_started:
+        return
+    wake_thread_started = True
+    thread = threading.Thread(target=listen_for_wake_word, daemon=True)
+    thread.start()
 
 # ================== API ROUTES ==================
 
@@ -282,6 +517,115 @@ def get_latest_state():
         state["timestamp"] = str(state["timestamp"])
     return jsonify(state or {})
 
+# ================== AI ROUTES ==================
+
+@app.route("/ai/teach-intent", methods=["POST"])
+def ai_teach_intent():
+    """Dạy AI câu lệnh custom"""
+    data = request.json or {}
+    trigger = data.get("trigger", "").strip()
+    action = data.get("action", "").strip()
+    if not trigger or not action:
+        return jsonify({"error": "trigger và action là bắt buộc"}), 400
+    result = ai_engine.teach_intent(trigger, action)
+    return jsonify({"success": True, "result": result})
+
+@app.route("/ai/teach-alias", methods=["POST"])
+def ai_teach_alias():
+    """Dạy AI từ đồng nghĩa cho thiết bị"""
+    data = request.json or {}
+    alias = data.get("alias", "").strip()
+    device = data.get("device", "").strip()
+    if not alias or not device:
+        return jsonify({"error": "alias và device là bắt buộc"}), 400
+    result = ai_engine.teach_alias(alias, device)
+    return jsonify({"success": True, "result": result})
+
+@app.route("/ai/teach-rule", methods=["POST"])
+def ai_teach_rule():
+    """Dạy AI luật tự động"""
+    data = request.json or {}
+    condition = data.get("condition", "").strip()
+    action = data.get("action", "").strip()
+    if not condition or not action:
+        return jsonify({"error": "condition và action là bắt buộc"}), 400
+    result = ai_engine.teach_rule(condition, action)
+    return jsonify({"success": True, "result": result})
+
+@app.route("/ai/process", methods=["POST"])
+def ai_process():
+    """Xử lý câu lệnh tự nhiên và publish MQTT"""
+    data = request.json or {}
+    text = data.get("text", "").strip()
+    if not text:
+        return jsonify({"error": "text là bắt buộc"}), 400
+
+    command = ai_engine.process_command(text)
+    if not command:
+        print(f"[AI] Text='{text}' => no command")
+        return jsonify({"success": False, "message": "Không tìm thấy lệnh phù hợp"})
+
+    if mqtt_client:
+        mqtt_client.publish(MQTT_TOPIC_CONTROL, command)
+        log_user_action(command, "ai/process", raw_text=text)
+        print(f"[AI] Text='{text}' => command={command}")
+        return jsonify({"success": True, "command": command})
+
+    return jsonify({"error": "MQTT not connected"}), 500
+
+@app.route("/voice/once", methods=["POST"])
+def voice_once():
+    """Thu âm một lần trên server, xử lý và gửi lệnh MQTT."""
+    if not VOICE_ENABLED:
+        return jsonify({"success": False, "message": "Voice disabled"}), 400
+    voice_priority_event.set()
+    text, error = voice_listen_once()
+    if not text:
+        print(f"[VOICE] Error: {error}")
+        voice_priority_event.clear()
+        return jsonify({"success": False, "message": error or "Không nghe rõ"}), 400
+
+    print(f"[VOICE] Heard: {text}")
+    command = ai_engine.process_command(text)
+    if not command:
+        print(f"[VOICE] No command for text: {text}")
+        voice_priority_event.clear()
+        return jsonify({"success": False, "text": text, "message": "Không hiểu lệnh"}), 200
+
+    if mqtt_client:
+        mqtt_client.publish(MQTT_TOPIC_CONTROL, command)
+        log_user_action(command, "voice", raw_text=text)
+        print(f"[VOICE] Text='{text}' => command={command}")
+        voice_priority_event.clear()
+        return jsonify({"success": True, "text": text, "command": command})
+
+    voice_priority_event.clear()
+    return jsonify({"success": False, "text": text, "message": "MQTT not connected"}), 500
+
+
+@app.route("/voice/status")
+def voice_status():
+    global wake_word_detected, wake_word_text
+    global wake_session_active, wake_response_ready, wake_response_text
+    detected = bool(wake_word_detected)
+    text = wake_word_text if detected else ""
+    response_ready = bool(wake_response_ready)
+    response_text = wake_response_text if response_ready else ""
+    active = bool(wake_session_active)
+    if detected:
+        wake_word_detected = False
+        wake_word_text = ""
+    if response_ready:
+        wake_response_ready = False
+        wake_response_text = ""
+    return jsonify({
+        "wake_word": detected,
+        "text": text,
+        "active": active,
+        "response_ready": response_ready,
+        "response_text": response_text
+    })
+
 # ================== CONTROL ROUTES ==================
 
 @app.route("/control/door", methods=["POST"])
@@ -300,6 +644,7 @@ def control_door():
         if mqtt_client:
             mqtt_client.publish(MQTT_TOPIC_CONTROL, command)
             print(f"Sent command: {command}")
+            log_user_action(command, "control/door")
             return jsonify({"success": True, "command": command})
         else:
             return jsonify({"error": "MQTT not connected"}), 500
@@ -319,6 +664,7 @@ def control_light():
         if mqtt_client:
             mqtt_client.publish(MQTT_TOPIC_CONTROL, command)
             print(f"Sent command: {command}")
+            log_user_action(command, "control/light")
             return jsonify({"success": True, "command": command})
         else:
             return jsonify({"error": "MQTT not connected"}), 500
@@ -337,6 +683,7 @@ def control_fan():
         if mqtt_client:
             mqtt_client.publish(MQTT_TOPIC_CONTROL, command)
             print(f"Sent command: {command}")
+            log_user_action(command, "control/fan")
             return jsonify({"success": True, "command": command})
         else:
             return jsonify({"error": "MQTT not connected"}), 500
@@ -355,6 +702,7 @@ def control_roof():
         if mqtt_client:
             mqtt_client.publish(MQTT_TOPIC_CONTROL, command)
             print(f"Sent command: {command}")
+            log_user_action(command, "control/roof")
             return jsonify({"success": True, "command": command})
         else:
             return jsonify({"error": "MQTT not connected"}), 500
@@ -366,5 +714,6 @@ def control_roof():
 if __name__ == "__main__":
     print("Initializing MQTT...")
     init_mqtt()
+    start_wake_word_listener()
     print("Server started on http://0.0.0.0:5000")
     app.run(host="0.0.0.0", port=5000, debug=True)
