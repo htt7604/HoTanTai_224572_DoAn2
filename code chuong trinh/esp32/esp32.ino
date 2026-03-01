@@ -5,6 +5,7 @@
 #include <SPI.h>
 #include <I2CKeyPad.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 
@@ -13,14 +14,50 @@ const char* ssid = "Thuong";
 const char* password = "12345678";
 
 // ================= CẤU HÌNH MQTT =================
-const char* mqtt_server = "192.168.1.6";  // Thay bằng IP LAN của máy tính
-const int mqtt_port = 1883;
+const char* mqtt_server = "3c5308fe02794486932d547731382984.s1.eu.hivemq.cloud";
+const int mqtt_port = 8883;
 const char* mqtt_topic_sensor = "esp32/sensor";
 const char* mqtt_topic_control = "esp32/control";
 const char* mqtt_client_id = "ESP32_SmartHome";
+const char* mqtt_username = "admin";
+const char* mqtt_password = "Tai083204009230";
+
+// CA certificate (Let's Encrypt ISRG Root X1) for HiveMQ Cloud TLS
+const char* mqtt_root_ca = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
+TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
+cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4
+WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu
+ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY
+MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc
+h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+
+0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U
+A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW
+T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH
+B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC
+B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv
+KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn
+OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn
+jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw
+qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI
+rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV
+HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq
+hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL
+ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ
+3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK
+NFtY2PwByVS5uCbMiogziUwxw4wS1qoR+3zqDjj/6sB1TLHQ+7X9rJfF6dV5z5V1
+0VvvXfPp8Mt3q4B0lXdwY6Dk4B8b4y8u+1Wr9m0d5Z8a1C+q+BDfQd9wM1s4bD1z
+4k4D5Pm2doW1cU6X9P2YX3rT0X5ypTXD9V8pj7bFfR7tPPY0L0P1l35b0K3L1B8J
+8zg7QK0wAoytgPpQ27r9N9BK4S7j/8nceT5EwD7z4luMHGQqt1hZb8INZZeQzgrI
+cg3FDUb8PsG+MzbkBTaoLB7Q8V5aKyA6h6VsdqWQ4rQ6ONYWnxo7xG45LTNuXa0h
+EK3y0tGQ5DA2rXfGcxph0Xo7yR3ZZ3YEMlV1N7Vv1o9scsZ/74H4g9P+q+8R3B0r
+0pWQw7O0eR8NvfI5ZGBv1Vx4aF4Aqk/Na7GzQ4L8V5Wn2tDx3d5XQ8i8uCIpB4s=
+-----END CERTIFICATE-----
+)EOF";
 
 // ================= MQTT CLIENT =================
-WiFiClient espClient;
+WiFiClientSecure espClient;
 PubSubClient client(espClient);
 
 // ================= KHAI BÁO PIN =================
@@ -125,7 +162,7 @@ void reconnectMQTT() {
     lcd.setCursor(0, 0);
     lcd.print("Connecting MQTT");
     
-    if (client.connect(mqtt_client_id)) {
+    if (client.connect(mqtt_client_id, mqtt_username, mqtt_password)) {
       Serial.println("connected!");
       client.subscribe(mqtt_topic_control);
       Serial.println("Subscribed to: esp32/control");
@@ -314,6 +351,7 @@ void setup() {
   connectWiFi();
   
   // Cấu hình MQTT
+  espClient.setCACert(mqtt_root_ca);
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(callback);
   
