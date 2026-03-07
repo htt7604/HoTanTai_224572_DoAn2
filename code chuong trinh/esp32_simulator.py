@@ -42,14 +42,14 @@ MQTT_CLIENT_ID = os.getenv(
     "MQTT_CLIENT_ID",
     f"ESP32_SIM_{random.randint(1000, 9999)}"
 )
-PUBLISH_INTERVAL = float(os.getenv("PUBLISH_INTERVAL", "3"))
+PUBLISH_INTERVAL = float(os.getenv("PUBLISH_INTERVAL", "2"))  # 2 giây
 
 # ================== STATE ==================
 state_lock = threading.Lock()
 stop_event = threading.Event()
 
 device_state = {
-    "door": "CLOSED",
+    "door": False,  # True = mở, False = đóng
     "light1": False,
     "light2": False,
     "light3": False,
@@ -127,10 +127,10 @@ def apply_command(command):
     changed = False
     with state_lock:
         if command == "DOOR_OPEN":
-            device_state["door"] = "OPEN"
+            device_state["door"] = True
             changed = True
         elif command == "DOOR_CLOSE":
-            device_state["door"] = "CLOSED"
+            device_state["door"] = False
             changed = True
         elif command == "LIGHT1_ON":
             device_state["light1"] = True

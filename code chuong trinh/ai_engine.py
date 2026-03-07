@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import re
 import joblib
@@ -9,9 +9,12 @@ from sklearn.pipeline import Pipeline
 
 class SmartHomeAI:
     """
-    AI Smart Home: học intent, alias và luật tự động.
-    An toàn: không dùng eval, parse điều kiện theo mẫu đơn giản.
+    AI Smart Home: học intent, alias, luật tự động và học từ hành vi.
+    An toàn: không dùng eval(), parse điều kiện theo mẫu đơn giản.
     """
+
+    VALID_RULE_KEYS = frozenset({"hour", "temp", "hum", "gas", "rain", "pir", "flame", "door"})
+    MIN_PATTERN_COUNT = 3
 
     def __init__(self, db):
         self.db = db
@@ -19,6 +22,7 @@ class SmartHomeAI:
         self.col_alias = db["ai_alias"]
         self.col_rules = db["ai_rules"]
         self.col_actions = db["user_actions"]
+        self.col_sensor = db["sensor_data"]
         self.col_meta = db["ai_meta"]
 
         self.model = None
@@ -60,6 +64,7 @@ class SmartHomeAI:
             "created_at": datetime.now()
         }
         self.col_rules.insert_one(doc)
+        print(f"[AI RULE CREATED] {condition} -> {action}")
         return {"inserted": True}
 
     # ================== CORE ==================
@@ -75,24 +80,20 @@ class SmartHomeAI:
         if not text_norm:
             return None
 
-        # 1) Custom intents (ưu tiên cao nhất)
         intent = self._match_intent(text_norm)
         if intent:
             return intent
 
-        # 2) Alias -> device
         device = self._match_alias(text_norm)
         if device:
             action = self._detect_action(text_norm)
             if action:
                 return self._build_command(device, action)
 
-        # 3) ML classifier (nếu đã train)
         ml_action = self._predict_intent(text_norm)
         if ml_action:
             return ml_action
 
-        # 4) Rule-based (dựa trên từ khóa thiết bị)
         action = self._detect_action(text_norm)
         if action:
             device = self._detect_device(text_norm)
@@ -102,53 +103,237 @@ class SmartHomeAI:
         return None
 
     def auto_decision(self, sensor_data: dict):
-        """
-        Áp dụng rule từ MongoDB với sensor_data.
-        Trả về list MQTT commands cần publish.
-        """
+        """Áp dụng rule từ MongoDB với sensor_data. Trả về list MQTT commands."""
         commands = []
-        rules = list(self.col_rules.find())
+        data = self._enrich_sensor_with_context(sensor_data)
+
+        rules = self.col_rules.find({"condition": {"$exists": True, "$ne": ""}})
         for rule in rules:
             condition = rule.get("condition", "")
             action = rule.get("action", "").upper()
-            if self._evaluate_condition(condition, sensor_data):
+            if condition and action and self._evaluate_condition(condition, data):
                 commands.append(action)
         return commands
 
-    def learn_patterns(self):
+    # ================== LEARNING ==================
+    def learn_from_sensor_behavior(self):
         """
-        Phân tích thói quen người dùng dựa trên user_actions.
-        Ví dụ: nếu một lệnh lặp lại nhiều lần ở cùng giờ => tạo rule.
+        Học từ user_actions + sensor_data.
+        Nếu cùng lệnh được thực thi >= 3 lần trong điều kiện cảm biến tương tự => tạo rule.
         """
-        actions = list(self.col_actions.find().sort("timestamp", -1).limit(500))
-        counter = {}
+        learned = 0
+        cutoff = datetime.now() - timedelta(days=14)
+        actions = list(self.col_actions.find(
+            {"timestamp": {"$gte": cutoff}, "command": {"$exists": True, "$ne": ""}}
+        ).sort("timestamp", -1).limit(500))
+
+        if not actions:
+            return {"learned_rules": 0}
+
+        sensor_cursor = self.col_sensor.find(
+            {"timestamp": {"$gte": cutoff}}
+        ).sort("timestamp", 1)
+        sensor_list = list(sensor_cursor)
+
+        def find_sensor_at(t):
+            if not sensor_list:
+                return None
+            best = None
+            best_diff = float("inf")
+            for s in sensor_list:
+                ts = s.get("timestamp")
+                if not ts:
+                    continue
+                diff = abs((ts - t).total_seconds())
+                if diff <= 300 and diff < best_diff:
+                    best_diff = diff
+                    best = s
+            return best
+
+        by_command = {}
         for a in actions:
             ts = a.get("timestamp")
-            cmd = a.get("command")
+            cmd = a.get("command", "").strip().upper()
+            if not ts or not cmd:
+                continue
+            s = find_sensor_at(ts)
+            if s is None:
+                continue
+            if cmd not in by_command:
+                by_command[cmd] = []
+            by_command[cmd].append(s)
+
+        for cmd, sensors in by_command.items():
+            if len(sensors) < self.MIN_PATTERN_COUNT:
+                continue
+
+            temps = [s.get("temp") for s in sensors if s.get("temp") is not None and isinstance(s.get("temp"), (int, float))]
+            hums = [s.get("hum") for s in sensors if s.get("hum") is not None and isinstance(s.get("hum"), (int, float))]
+            rains = [s.get("rain") for s in sensors if s.get("rain") is not None]
+            gas_vals = [s.get("gas") for s in sensors if s.get("gas") is not None]
+
+            conditions = []
+
+            if len(temps) >= self.MIN_PATTERN_COUNT:
+                min_temp = min(temps)
+                if min_temp >= 25:
+                    thresh = int(min_temp) - 1
+                    conditions.append(f"temp >= {thresh}")
+
+            if len(rains) >= self.MIN_PATTERN_COUNT and sum(1 for r in rains if r) >= self.MIN_PATTERN_COUNT:
+                conditions.append("rain == true")
+
+            if len(gas_vals) >= self.MIN_PATTERN_COUNT:
+                min_gas = min(gas_vals)
+                if min_gas >= 300:
+                    thresh = int(min_gas) - 50
+                    conditions.append(f"gas >= {max(0, thresh)}")
+
+            if not conditions:
+                continue
+
+            cond_str = " and ".join(conditions)
+            exists = self.col_rules.find_one({"condition": cond_str, "action": cmd})
+            if not exists:
+                self.col_rules.insert_one({
+                    "condition": cond_str,
+                    "action": cmd,
+                    "created_at": datetime.now(),
+                    "source": "learn_from_sensor_behavior"
+                })
+                print(f"[AI LEARN] Tạo rule từ hành vi: {cond_str} -> {cmd}")
+                learned += 1
+
+        return {"learned_rules": learned}
+
+    def learn_patterns(self):
+        """
+        Phát hiện pattern: cùng lệnh, cùng khoảng giờ, >= 3 lần.
+        Tạo rule: hour >= X and hour <= Y -> ACTION
+        """
+        learned = 0
+        cutoff = datetime.now() - timedelta(days=30)
+        actions = list(self.col_actions.find(
+            {"timestamp": {"$gte": cutoff}, "command": {"$exists": True, "$ne": ""}}
+        ).sort("timestamp", -1).limit(500))
+
+        by_cmd = {}
+        for a in actions:
+            ts = a.get("timestamp")
+            cmd = a.get("command", "").strip().upper()
             if not ts or not cmd:
                 continue
             hour = ts.hour
-            key = (hour, cmd)
-            counter[key] = counter.get(key, 0) + 1
+            key = cmd
+            if key not in by_cmd:
+                by_cmd[key] = []
+            by_cmd[key].append(hour)
 
-        for (hour, cmd), count in counter.items():
-            if count >= 3:
-                condition = f"hour == {hour}"
-                exists = self.col_rules.find_one({"condition": condition, "action": cmd})
-                if not exists:
-                    self.col_rules.insert_one({
-                        "condition": condition,
-                        "action": cmd,
-                        "created_at": datetime.now(),
-                        "source": "learn_patterns"
-                    })
+        for cmd, hours in by_cmd.items():
+            if len(hours) < self.MIN_PATTERN_COUNT:
+                continue
+            min_h, max_h = min(hours), max(hours)
+            if max_h - min_h > 6:
+                continue
+            cond = f"hour >= {min_h} and hour <= {max_h}"
+            exists = self.col_rules.find_one({"condition": cond, "action": cmd})
+            if not exists:
+                self.col_rules.insert_one({
+                    "condition": cond,
+                    "action": cmd,
+                    "created_at": datetime.now(),
+                    "source": "learn_patterns"
+                })
+                print(f"[AI RULE CREATED] {cond} -> {cmd} (từ pattern giờ)")
+                learned += 1
 
-        return {"learned_rules": len(counter)}
+        return {"learned_rules": learned}
+
+    # ================== CONTEXT ==================
+    def detect_context(self, sensor_data: dict) -> dict:
+        """
+        Phát hiện ngữ cảnh từ sensor_data.
+        Trả về: hot, cold, rain, night, day, humid, gas_alert, motion, fire
+        """
+        data = sensor_data or {}
+        now = datetime.now()
+        hour = now.hour
+        temp = self._safe_float(data.get("temp"), 25.0)
+        hum = self._safe_float(data.get("hum"), 60.0)
+        gas = self._safe_int(data.get("gas"), 0)
+        rain = bool(data.get("rain"))
+        pir = bool(data.get("pir"))
+        flame = bool(data.get("flame"))
+
+        return {
+            "hot": temp >= 30,
+            "cold": temp < 20,
+            "rain": rain,
+            "night": hour >= 18 or hour < 6,
+            "day": 6 <= hour < 18,
+            "humid": hum >= 70,
+            "gas_alert": gas > 400,
+            "motion": pir,
+            "fire": flame,
+        }
+
+    def _safe_float(self, v, default):
+        if v is None:
+            return default
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+
+    def _safe_int(self, v, default):
+        if v is None:
+            return default
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return default
+
+    # ================== RETRAIN ==================
+    def retrain_model_if_needed(self) -> bool:
+        """
+        Retrain nếu:
+        - new_intents >= 5 HOẶC
+        - last_training > 24 giờ
+        """
+        meta = self.col_meta.find_one({"_id": "intent_model"}) or {}
+        new_count = int(meta.get("new_intents_since_train", 0))
+        last_trained = meta.get("last_trained_at")
+        now = datetime.now()
+
+        should_train = new_count >= 5
+        if last_trained:
+            if (now - last_trained).total_seconds() > 86400:
+                should_train = True
+        else:
+            should_train = True
+
+        if not should_train:
+            return False
+
+        trained = self._train_intent_model_if_possible()
+        if trained:
+            self.col_meta.update_one(
+                {"_id": "intent_model"},
+                {"$set": {
+                    "new_intents_since_train": 0,
+                    "last_trained_at": now,
+                    "trained_count": trained,
+                    "updated_at": now
+                },
+                 "$setOnInsert": {"created_at": now}},
+                upsert=True
+            )
+            print(f"[AI TRAIN] Retrain hoàn tất, {trained} mẫu")
+        return bool(trained)
 
     # ================== UTILITIES ==================
     def _normalize_text(self, text: str):
-        text = re.sub(r"\s+", " ", text.strip().lower())
-        # Chuẩn hóa cụm "số/so" và số tiếng Việt cơ bản
+        text = re.sub(r"\s+", " ", str(text).strip().lower())
         text = re.sub(r"\b(số|so)\b", " ", text)
         text = re.sub(r"\bmột\b", "1", text)
         text = re.sub(r"\bmot\b", "1", text)
@@ -156,20 +341,27 @@ class SmartHomeAI:
         text = re.sub(r"\bba\b", "3", text)
         return text
 
+    def _enrich_sensor_with_context(self, data: dict) -> dict:
+        """Thêm hour vào sensor_data để rule có thể dùng"""
+        d = dict(data) if data else {}
+        ts = d.get("timestamp")
+        if ts:
+            d["hour"] = ts.hour if hasattr(ts, "hour") else datetime.now().hour
+        else:
+            d["hour"] = datetime.now().hour
+        return d
+
     # ================== ML INTENT CLASSIFIER ==================
     def _load_model_on_startup(self):
-        """Load model nếu có sẵn, nếu chưa có thì train nếu đủ dữ liệu"""
         if os.path.exists(self.model_path):
             try:
                 self.model = joblib.load(self.model_path)
                 return
             except Exception:
                 self.model = None
-        # Nếu chưa có model, thử train khi đủ dữ liệu
         self._train_intent_model_if_possible()
 
     def _increase_new_intents_and_retrain_if_needed(self):
-        """Tăng bộ đếm lệnh mới, đủ 5 thì retrain"""
         meta = self.col_meta.find_one({"_id": "intent_model"}) or {}
         new_count = int(meta.get("new_intents_since_train", 0)) + 1
         self.col_meta.update_one(
@@ -183,34 +375,53 @@ class SmartHomeAI:
             if trained:
                 self.col_meta.update_one(
                     {"_id": "intent_model"},
-                    {"$set": {"new_intents_since_train": 0,
-                              "last_trained_at": datetime.now(),
-                              "trained_count": trained}},
+                    {"$set": {
+                        "new_intents_since_train": 0,
+                        "last_trained_at": datetime.now(),
+                        "trained_count": trained
+                    }},
                     upsert=True
                 )
 
     def _train_intent_model_if_possible(self):
-        """Train model nếu có đủ dữ liệu, trả về số mẫu train"""
-        intents = list(self.col_intents.find())
-        if len(intents) < 2:
+        """Train model nếu đủ dữ liệu. Đảm bảo texts và labels luôn align."""
+        intents = list(self.col_intents.find({"trigger": {"$exists": True, "$ne": ""}}))
+
+        pairs = []
+        for it in intents:
+            trigger = it.get("trigger", "").strip()
+            action = it.get("action", "").strip()
+            if trigger and action:
+                pairs.append((trigger, action))
+
+        if len(pairs) < 2:
             return 0
 
-        texts = [it.get("trigger", "") for it in intents if it.get("trigger")]
-        labels = [it.get("action", "") for it in intents if it.get("trigger")]
-        if len(set(labels)) < 2:
+        labels_unique = {p[1] for p in pairs}
+        if len(labels_unique) < 2:
             return 0
+
+        texts = [p[0] for p in pairs]
+        labels = [p[1] for p in pairs]
 
         model = Pipeline([
-            ("tfidf", TfidfVectorizer(ngram_range=(1, 2))),
-            ("clf", LogisticRegression(max_iter=1000))
+            ("tfidf", TfidfVectorizer(
+                ngram_range=(1, 3),
+                min_df=1,
+                max_df=0.9
+            )),
+            ("clf", LogisticRegression(
+                max_iter=2000,
+                class_weight="balanced"
+            ))
         ])
         model.fit(texts, labels)
         joblib.dump(model, self.model_path)
         self.model = model
+        print(f"[AI TRAIN] Đã train {len(texts)} mẫu, {len(labels_unique)} lớp")
         return len(texts)
 
     def _predict_intent(self, text_norm: str):
-        """Dự đoán action bằng ML, có ngưỡng tin cậy"""
         if not self.model:
             return None
         try:
@@ -222,18 +433,18 @@ class SmartHomeAI:
                 best = float(max(proba))
                 if best < 0.55:
                     return None
+            short = (text_norm[:40] + "..") if len(text_norm) > 40 else text_norm
+            print(f"[AI PREDICT] \"{short}\" -> {pred}")
             return pred
         except Exception:
             return None
 
     def _match_intent(self, text_norm: str):
-        # Ưu tiên khớp đúng
-        exact = self.col_intents.find_one({"trigger": text_norm})
+        exact = self.col_intents.find_one({"trigger": text_norm}, projection={"action": 1})
         if exact:
             return exact.get("action")
 
-        # Khớp theo substring (trigger là một phần của câu lệnh)
-        intents = list(self.col_intents.find())
+        intents = list(self.col_intents.find({"trigger": {"$exists": True, "$ne": ""}}, projection={"trigger": 1, "action": 1}))
         intents.sort(key=lambda x: len(x.get("trigger", "")), reverse=True)
         for it in intents:
             trigger = it.get("trigger", "")
@@ -242,7 +453,7 @@ class SmartHomeAI:
         return None
 
     def _match_alias(self, text_norm: str):
-        aliases = list(self.col_alias.find())
+        aliases = list(self.col_alias.find({"alias": {"$exists": True, "$ne": ""}}, projection={"alias": 1, "device": 1}))
         aliases.sort(key=lambda x: len(x.get("alias", "")), reverse=True)
         for al in aliases:
             alias = al.get("alias", "")
@@ -251,7 +462,6 @@ class SmartHomeAI:
         return None
 
     def _detect_action(self, text_norm: str):
-        # Ưu tiên tiếng Việt
         if "bật" in text_norm or re.search(r"\bturn on\b", text_norm) or re.search(r"\bon\b", text_norm):
             return "on"
         if "tắt" in text_norm or re.search(r"\bturn off\b", text_norm) or re.search(r"\boff\b", text_norm):
@@ -262,8 +472,7 @@ class SmartHomeAI:
             return "close"
         return None
 
-    def _detect_device(self, text_norm: str): 
-        # Thiết bị hỗ trợ mặc định
+    def _detect_device(self, text_norm: str):
         device_keywords = {
             "light1": ["đèn 1", "đèn1", "den 1", "den1", "light 1", "light1", "đèn một", "den mot"],
             "light2": ["đèn 2", "đèn2", "den 2", "den2", "light 2", "light2", "đèn hai", "den hai"],
@@ -276,7 +485,6 @@ class SmartHomeAI:
             for kw in keywords:
                 if kw in text_norm:
                     return device
-        # Fallback: nếu chỉ nói "đèn" không kèm số, mặc định đèn 1
         if "đèn" in text_norm or "den" in text_norm or "light" in text_norm:
             return "light1"
         return None
@@ -308,25 +516,24 @@ class SmartHomeAI:
 
     def _evaluate_condition(self, condition: str, data: dict):
         """
-        Parse và đánh giá điều kiện an toàn.
-        Hỗ trợ: temp > 30, gas <= 400, rain == true, hour == 18
-        Hỗ trợ AND/OR đơn giản: "temp > 30 and hum < 70"
+        Đánh giá điều kiện an toàn (không dùng eval).
+        Hỗ trợ: hour, temp, hum, gas, rain, pir, flame, door
+        Ví dụ: hour >= 18 and rain == true -> ROOF_CLOSE
         """
         condition = condition.strip()
         if not condition:
             return False
 
-        # Ưu tiên tách OR trước
+        data = self._enrich_sensor_with_context(data or {})
+
         if " or " in condition or "||" in condition:
             parts = re.split(r"\s+or\s+|\s*\|\|\s*", condition)
-            return any(self._evaluate_condition(p, data) for p in parts)
+            return any(self._evaluate_condition(p.strip(), data) for p in parts)
 
-        # Tách AND
         if " and " in condition or "&&" in condition:
             parts = re.split(r"\s+and\s+|\s*&&\s*", condition)
-            return all(self._evaluate_condition(p, data) for p in parts)
+            return all(self._evaluate_condition(p.strip(), data) for p in parts)
 
-        # Parse điều kiện đơn
         match = re.match(
             r"^\s*([a-zA-Z_]\w*)\s*(==|!=|>=|<=|>|<)\s*(.+?)\s*$",
             condition
@@ -335,7 +542,13 @@ class SmartHomeAI:
             return False
 
         key, op, raw_value = match.groups()
+        key = key.lower()
+        if key not in self.VALID_RULE_KEYS:
+            return False
+
         left = data.get(key)
+        if left is None and key == "hour":
+            left = datetime.now().hour
         if left is None:
             return False
 
@@ -346,18 +559,16 @@ class SmartHomeAI:
         return self._compare(left, right, op)
 
     def _parse_value(self, raw_value: str):
-        raw_value = raw_value.strip().lower()
+        raw_value = str(raw_value).strip().lower()
         if raw_value in ["true", "false"]:
             return raw_value == "true"
 
-        # Chuỗi có dấu nháy
         if (raw_value.startswith("'") and raw_value.endswith("'")) or \
            (raw_value.startswith('"') and raw_value.endswith('"')):
             return raw_value[1:-1]
 
-        # Số nguyên hoặc float
         if re.match(r"^-?\d+(\.\d+)?$", raw_value):
-            return float(raw_value) if "." in raw_value else int(raw_value)
+            return float(raw_value) if "." in raw_value else int(float(raw_value))
 
         return None
 
