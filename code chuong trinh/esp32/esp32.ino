@@ -10,8 +10,8 @@
 #include <ArduinoJson.h>
 
 // ================= CẤU HÌNH WIFI =================
-const char* ssid = "Thuong";
-const char* password = "12345678";
+const char* ssid = "P3.15";
+const char* password = "namcanthoDNC";
 
 // ================= CẤU HÌNH MQTT =================
 const char* mqtt_server = "3c5308fe02794486932d547731382984.s1.eu.hivemq.cloud";
@@ -19,8 +19,8 @@ const int mqtt_port = 8883;
 const char* mqtt_topic_sensor = "esp32/sensor";
 const char* mqtt_topic_control = "esp32/control";
 const char* mqtt_client_id = "ESP32_SmartHome";
-const char* mqtt_username = "admin";
-const char* mqtt_password = "Tai083204009230";
+const char* mqtt_username = "esp32";
+const char* mqtt_password = "Esp32123";
 
 // CA certificate (Let's Encrypt ISRG Root X1) for HiveMQ Cloud TLS
 const char* mqtt_root_ca = R"EOF(
@@ -351,7 +351,8 @@ void setup() {
   connectWiFi();
   
   // Cấu hình MQTT
-  espClient.setCACert(mqtt_root_ca);
+  // espClient.setCACert(mqtt_root_ca);
+  espClient.setInsecure();
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(callback);
   
