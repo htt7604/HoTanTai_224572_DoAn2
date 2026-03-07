@@ -9,6 +9,7 @@ import os
 import threading
 import time
 from ai_engine import SmartHomeAI
+import re
 try:
     import speech_recognition as sr
 except Exception:
@@ -77,7 +78,7 @@ mqtt_client = None
 # ================== VOICE CONTROL ==================
 VOICE_ENABLED = os.getenv("VOICE_ENABLED", "1") == "1"
 VOICE_LANGUAGE = os.getenv("VOICE_LANGUAGE", "vi-VN")
-WAKE_WORD = "nhà tôi ơi"
+WAKE_WORD = "nhà ơi"
 tts_engine = None
 tts_lock = threading.Lock()
 wake_thread_started = False
@@ -316,126 +317,207 @@ def start_voice_listener():
     return
 
 
-def describe_command(command):
-    cmd = (command or "").strip().upper()
-    if not cmd:
-        return "Tôi đã thực hiện lệnh"
-    if cmd == "DOOR_OPEN":
-        return "Tôi đã mở cửa"
-    if cmd == "DOOR_CLOSE":
-        return "Tôi đã đóng cửa"
-    if cmd == "FAN_ON":
-        return "Tôi đã bật quạt"
-    if cmd == "FAN_OFF":
-        return "Tôi đã tắt quạt"
-    if cmd == "ROOF_OPEN":
-        return "Tôi đã mở rèm"
-    if cmd == "ROOF_CLOSE":
-        return "Tôi đã đóng rèm"
-    if cmd.startswith("LIGHT") and cmd.endswith("_ON"):
-        light_num = cmd.replace("LIGHT", "").replace("_ON", "")
-        return f"Tôi đã bật đèn {light_num}"
-    if cmd.startswith("LIGHT") and cmd.endswith("_OFF"):
-        light_num = cmd.replace("LIGHT", "").replace("_OFF", "")
-        return f"Tôi đã tắt đèn {light_num}"
-    return f"Tôi đã thực hiện lệnh {cmd}"
+# def describe_command(command):
+#     cmd = (command or "").strip().upper()
+#     if not cmd:
+#         return "Tôi đã thực hiện lệnh"
+#     if cmd == "DOOR_OPEN":
+#         return "Tôi đã mở cửa"
+#     if cmd == "DOOR_CLOSE":
+#         return "Tôi đã đóng cửa"
+#     if cmd == "FAN_ON":
+#         return "Tôi đã bật quạt"
+#     if cmd == "FAN_OFF":
+#         return "Tôi đã tắt quạt"
+#     if cmd == "ROOF_OPEN":
+#         return "Tôi đã mở rèm"
+#     if cmd == "ROOF_CLOSE":
+#         return "Tôi đã đóng rèm"
+#     if cmd.startswith("LIGHT") and cmd.endswith("_ON"):
+#         light_num = cmd.replace("LIGHT", "").replace("_ON", "")
+#         return f"Tôi đã bật đèn {light_num}"
+#     if cmd.startswith("LIGHT") and cmd.endswith("_OFF"):
+#         light_num = cmd.replace("LIGHT", "").replace("_OFF", "")
+#         return f"Tôi đã tắt đèn {light_num}"
+#     return f"Tôi đã thực hiện lệnh {cmd}"
+def describe_command(command: str):
+    if not command:
+        return "Tôi không hiểu lệnh"
 
+    command = command.upper()
+
+    # ===== LIGHT =====
+    match = re.match(r"LIGHT(\d+)_(ON|OFF)", command)
+    if match:
+        number = match.group(1)
+        action = match.group(2)
+        if action == "ON":
+            return f"Đã bật đèn {number}"
+        else:
+            return f"Đã tắt đèn {number}"
+
+    # ===== FAN =====
+    if command == "FAN_ON":
+        return "Đã bật quạt"
+    if command == "FAN_OFF":
+        return "Đã tắt quạt"
+
+    # ===== DOOR =====
+    if command == "DOOR_OPEN":
+        return "Đã mở cửa"
+    if command == "DOOR_CLOSE":
+        return "Đã đóng cửa"
+
+    # ===== ROOF =====
+    if command == "ROOF_OPEN":
+        return "Đã mở mái"
+    if command == "ROOF_CLOSE":
+        return "Đã đóng mái"
+
+    return "Đã thực hiện lệnh"
+
+# def speak(text):
+#     if not VOICE_ENABLED:
+#         return
+#     if pyttsx3 is None:
+#         return
+#     global tts_engine
+#     with tts_lock:
+#         if tts_engine is None:
+#             try:
+#                 tts_engine = pyttsx3.init()
+#             except Exception:
+#                 tts_engine = None
+#                 return
+#         try:
+#             tts_engine.say(text)
+#             tts_engine.runAndWait()
+#         except Exception:
+#             return
 
 def speak(text):
-    if not VOICE_ENABLED:
+    if not VOICE_ENABLED or pyttsx3 is None:
         return
-    if pyttsx3 is None:
-        return
-    global tts_engine
-    with tts_lock:
-        if tts_engine is None:
-            try:
-                tts_engine = pyttsx3.init()
-            except Exception:
-                tts_engine = None
-                return
+
+    def _speak():
         try:
-            tts_engine.say(text)
-            tts_engine.runAndWait()
-        except Exception:
-            return
+            engine = pyttsx3.init()
+            engine.say(text)
+            engine.runAndWait()
+            engine.stop()
+        except Exception as e:
+            print("TTS error:", e)
+
+    t = threading.Thread(target=_speak)
+    t.start()
 
 
 def listen_for_wake_word():
+    global wake_word_detected, wake_word_text
+    global wake_session_active, wake_response_ready, wake_response_text
+
     if not VOICE_ENABLED or sr is None:
+        print("Voice disabled or speech_recognition not available")
         return
+
     recognizer = sr.Recognizer()
+    print("Wake word listener started...")
+
     while True:
         if voice_priority_event.is_set():
             time.sleep(0.1)
             continue
+
         try:
             with sr.Microphone() as source:
                 recognizer.adjust_for_ambient_noise(source, duration=0.8)
+                print("Listening for wake word...")
                 audio = recognizer.listen(source)
+
             heard = recognizer.recognize_google(audio, language=VOICE_LANGUAGE)
-        except Exception:
+            print("Heard wake:", heard)
+
+        except Exception as e:
+            print("Wake error:", e)
             continue
 
         if not heard:
             continue
-        if WAKE_WORD in heard.strip().lower():
-            global wake_word_detected, wake_word_text
-            global wake_session_active, wake_response_ready, wake_response_text
-            wake_word_detected = True
-            wake_word_text = WAKE_WORD
-            wake_session_active = True
-            wake_response_ready = False
-            wake_response_text = ""
-            speak("Nhà đây bạn cần gì")
-            try:
-                with sr.Microphone() as source:
-                    recognizer.adjust_for_ambient_noise(source, duration=0.6)
-                    cmd_audio = recognizer.listen(source)
-                cmd_text = recognizer.recognize_google(cmd_audio, language=VOICE_LANGUAGE)
-            except Exception:
-                response = "Tôi không hiểu lệnh"
-                speak(response)
-                wake_response_text = response
-                wake_response_ready = True
-                wake_session_active = False
-                continue
 
-            if not cmd_text:
-                response = "Tôi không hiểu lệnh"
-                speak(response)
-                wake_response_text = response
-                wake_response_ready = True
-                wake_session_active = False
-                continue
+        if WAKE_WORD not in heard.strip().lower():
+            continue
 
-            command = ai_engine.process_command(cmd_text)
-            if not command:
-                response = "Tôi không hiểu lệnh"
-                speak(response)
-                wake_response_text = response
-                wake_response_ready = True
-                wake_session_active = False
-                continue
+        # ===== Wake word detected =====
+        print("Wake word detected!")
+        wake_word_detected = True
+        wake_word_text = WAKE_WORD
+        wake_session_active = True
+        wake_response_ready = False
+        wake_response_text = ""
 
-            if mqtt_client:
-                result = mqtt_client.publish(MQTT_TOPIC_CONTROL, command)
-                log_user_action(command, "wake_word", raw_text=cmd_text)
-                if getattr(result, "rc", None) == mqtt.MQTT_ERR_SUCCESS:
-                    response = describe_command(command)
-                    speak(response)
-                else:
-                    response = "Tôi chưa gửi được lệnh"
-                    speak(response)
-                wake_response_text = response
-                wake_response_ready = True
-                wake_session_active = False
+        speak("Nhà đây bạn cần gì")
+
+        # ===== Listen for command =====
+        try:
+            with sr.Microphone() as source:
+                recognizer.adjust_for_ambient_noise(source, duration=0.6)
+                print("Listening for command...")
+                cmd_audio = recognizer.listen(source)
+
+            cmd_text = recognizer.recognize_google(cmd_audio, language=VOICE_LANGUAGE)
+            print("Command heard:", cmd_text)
+
+        except Exception as e:
+            print("Command error:", e)
+            response = "Tôi không hiểu lệnh"
+            speak(response)
+            wake_response_text = response
+            wake_response_ready = True
+            wake_session_active = False
+            continue
+
+        if not cmd_text:
+            response = "Tôi không hiểu lệnh"
+            speak(response)
+            wake_response_text = response
+            wake_response_ready = True
+            wake_session_active = False
+            continue
+
+        # ===== Process AI =====
+        command = ai_engine.process_command(cmd_text)
+        print("AI parsed command:", command)
+
+        if not command:
+            response = "Tôi không hiểu lệnh"
+            speak(response)
+            wake_response_text = response
+            wake_response_ready = True
+            wake_session_active = False
+            continue
+
+        # ===== Publish MQTT =====
+        if mqtt_client:
+            result = mqtt_client.publish(MQTT_TOPIC_CONTROL, command)
+            log_user_action(command, "wake_word", raw_text=cmd_text)
+
+            if getattr(result, "rc", None) == mqtt.MQTT_ERR_SUCCESS:
+                response = describe_command(command)
+                print("MQTT sent successfully")
             else:
-                response = "MQTT chưa kết nối"
-                speak(response)
-                wake_response_text = response
-                wake_response_ready = True
-                wake_session_active = False
+                response = "Tôi chưa gửi được lệnh"
+                print("MQTT send failed")
+
+        else:
+            response = "MQTT chưa kết nối"
+            print("MQTT client is None")
+
+        speak(response)
+        wake_response_text = response
+        wake_response_ready = True
+        wake_session_active = False
+
+        time.sleep(1)
 
 
 def start_wake_word_listener():
@@ -716,4 +798,5 @@ if __name__ == "__main__":
     init_mqtt()
     start_wake_word_listener()
     print("Server started on http://0.0.0.0:5000")
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=False)
+    
