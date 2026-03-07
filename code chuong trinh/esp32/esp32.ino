@@ -18,6 +18,7 @@ const char* mqtt_server = "3c5308fe02794486932d547731382984.s1.eu.hivemq.cloud";
 const int mqtt_port = 8883;
 const char* mqtt_topic_sensor = "esp32/sensor";
 const char* mqtt_topic_control = "esp32/control";
+const char* mqtt_topic_events = "esp32/events";
 const char* mqtt_client_id = "ESP32_SmartHome";
 const char* mqtt_username = "esp32";
 const char* mqtt_password = "Esp32123";
@@ -85,7 +86,9 @@ const String PASSWORD = "123456A";
 String inputPassword = "";
 bool isEnteringPassword = false;
 unsigned long lastKeyTime = 0;
+unsigned long lastCharAddedTime = 0;  // Thời điểm nhập ký tự cuối (để hiển thị 300ms rồi đổi sang *)
 const unsigned long PASSWORD_TIMEOUT = 10000; // 10 giây timeout
+const unsigned long CHAR_DISPLAY_MS = 300;    // Hiển thị ký tự thật 300ms trước khi đổi thành *
 
 // ================= BIẾN TRẠNG THÁI =================
 bool isDoorOpen = false;
@@ -283,6 +286,18 @@ void sendToESP8266(const char* command) {
   Serial.println(command);
 }
 
+// Gửi event lên server qua MQTT
+void publishEvent(const char* eventName) {
+  if (!client.connected()) return;
+  StaticJsonDocument<128> doc;
+  doc["event"] = eventName;
+  char buf[128];
+  serializeJson(doc, buf);
+  client.publish(mqtt_topic_events, buf);
+  Serial.print("Published event: ");
+  Serial.println(eventName);
+}
+
 void publishSensorData() {
   if (!client.connected()) {
     return;
@@ -306,6 +321,7 @@ void publishSensorData() {
   doc["light1"] = light1State;
   doc["light2"] = light2State;
   doc["light3"] = light3State;
+  doc["fan"] = fanRunning;
   
   char jsonBuffer[256];
   serializeJson(doc, jsonBuffer);
@@ -396,13 +412,15 @@ void loop() {
   int  gasValue    = analogRead(GAS_PIN);
   bool gasDetected = (gasValue > 400);
 
-  // ===== XỬ LÝ MƯA - ĐÓNG RÈM =====
+  // ===== XỬ LÝ MƯA - ĐÓNG RÈM TỰ ĐỘNG =====
   if (isRaining != lastRainState) {
     if (isRaining) {
       sendToESP8266("ROOF_CLOSE");
+      publishEvent("ROOF_AUTO_CLOSE_RAIN");
       Serial.println("Mua phat hien - Dong rem");
     } else {
       sendToESP8266("ROOF_OPEN");
+      publishEvent("ROOF_AUTO_OPEN");
       Serial.println("Het mua - Mo rem");
     }
     lastRainState = isRaining;
@@ -434,6 +452,7 @@ void loop() {
     digitalWrite(BUZZER_PIN, HIGH);
     if (millis() - lastFireMsg > 3000) {
       sendToESP8266("FIRE_ALARM");
+      publishEvent("BUZZER_ALARM");
       lastFireMsg = millis();
     }
   }
@@ -444,22 +463,25 @@ void loop() {
     digitalWrite(BUZZER_PIN, LOW);
   }
 
-  // ===== PIR =====
+  // ===== PIR - HUMAN DETECTED =====
   if (pirDetected != lastPirState) {
     sendToESP8266(pirDetected ? "HUMAN_DETECTED" : "HUMAN_LEFT");
+    publishEvent(pirDetected ? "HUMAN_DETECTED" : "HUMAN_LEFT");
     lastPirState = pirDetected;
   }
 
   // ===== LCD HIỂN THỊ CHUYÊN NGHIỆP =====
-  if (millis() - lastLcdUpdate >= 500) {
+  unsigned long lcdInterval = isEnteringPassword ? 100 : 500;
+  if (millis() - lastLcdUpdate >= lcdInterval) {
     displayLCD();
     lastLcdUpdate = millis();
   }
 
-  // ===== RFID - TỰ ĐỘNG MỞ CỬA =====
+  // ===== RFID - TỰ ĐỘNG MỞ/ĐÓNG CỬA =====
   if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
     isDoorOpen = !isDoorOpen;
     sendToESP8266(isDoorOpen ? "DOOR_OPEN" : "DOOR_CLOSE");
+    publishEvent(isDoorOpen ? "RFID_OPEN" : "RFID_CLOSE");
     
     lcd.clear();
     lcd.setCursor(0, 0);
@@ -511,64 +533,30 @@ void loop() {
   delay(20);
 }
 
+// ===== HIỂN THỊ MÀN HÌNH NHẬP MẬT KHẨU (gọi từ displayLCD khi isEnteringPassword) =====
+void displayPasswordInput() {
+  lcd.setCursor(0, 0);
+  lcd.print("Nhap mat khau  ");
+  lcd.setCursor(0, 1);
+  String disp = "";
+  for (unsigned int i = 0; i < inputPassword.length(); i++) {
+    if (i == inputPassword.length() - 1 && 
+        (millis() - lastCharAddedTime < CHAR_DISPLAY_MS) &&
+        lastCharAddedTime > 0) {
+      disp += inputPassword[i];
+    } else {
+      disp += '*';
+    }
+  }
+  lcd.print(disp);
+  for (int i = disp.length(); i < 16; i++) lcd.print(" ");
+}
+
 // ===== XỬ LÝ KEYPAD =====
 void handleKeypad(char key) {
   lastKeyTime = millis();
 
-  // Bắt đầu nhập mật khẩu khi nhấn phím đầu tiên
-  if (!isEnteringPassword && key != 'A' && key != 'B' && key != 'C' && key != 'D') {
-    isEnteringPassword = true;
-    inputPassword = "";
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("ENTER PASSWORD:");
-    lcd.setCursor(0, 1);
-  }
-
-  if (isEnteringPassword) {
-    if (key == '*') {
-      // Xóa ký tự cuối
-      if (inputPassword.length() > 0) {
-        inputPassword = inputPassword.substring(0, inputPassword.length() - 1);
-        lcd.setCursor(inputPassword.length(), 1);
-        lcd.print(" ");
-        lcd.setCursor(inputPassword.length(), 1);
-      }
-    } else if (key == '#') {
-      // Xác nhận mật khẩu
-      if (inputPassword == PASSWORD) {
-        isDoorOpen = !isDoorOpen;
-        sendToESP8266(isDoorOpen ? "DOOR_OPEN" : "DOOR_CLOSE");
-        
-        lcd.clear();
-        lcd.setCursor(0, 0);
-        lcd.print("PASSWORD OK!");
-        lcd.setCursor(0, 1);
-        lcd.print(isDoorOpen ? "DOOR: OPENED" : "DOOR: CLOSED");
-        delay(2000);
-        lcd.clear();
-      } else {
-        lcd.clear();
-        lcd.setCursor(0, 0);
-        lcd.print("WRONG PASSWORD!");
-        lcd.setCursor(0, 1);
-        lcd.print("ACCESS DENIED");
-        delay(2000);
-        lcd.clear();
-      }
-      isEnteringPassword = false;
-      inputPassword = "";
-    } else if (key != 'A' && key != 'B' && key != 'C' && key != 'D') {
-      // Thêm ký tự vào mật khẩu
-      if (inputPassword.length() < 16) {
-        inputPassword += key;
-        lcd.setCursor(inputPassword.length() - 1, 1);
-        lcd.print("*");
-      }
-    }
-  }
-
-  // Phím B - Tắt buzzer và quạt
+  // Phím B - Tắt buzzer và quạt (luôn xử lý)
   if (key == 'B') {
     digitalWrite(BUZZER_PIN, LOW);
     if (fanRunning) {
@@ -580,11 +568,72 @@ void handleKeypad(char key) {
     lcd.print("ALARM RESET");
     delay(1000);
     lcd.clear();
+    return;
+  }
+
+  // Bắt đầu nhập mật khẩu khi nhấn phím số đầu tiên (không phải A,B,C,D)
+  if (!isEnteringPassword && key != 'A' && key != 'C' && key != 'D') {
+    if (key == '*' || key == '#') {
+      return;
+    }
+    isEnteringPassword = true;
+    inputPassword = "";
+    lastCharAddedTime = 0;
+    lcd.clear();
+  }
+
+  if (isEnteringPassword) {
+    if (key == '*') {
+      if (inputPassword.length() > 0) {
+        inputPassword = inputPassword.substring(0, inputPassword.length() - 1);
+        lastCharAddedTime = 0;
+        displayPasswordInput();
+      }
+    } else if (key == '#') {
+      if (inputPassword == PASSWORD) {
+        isDoorOpen = !isDoorOpen;
+        sendToESP8266(isDoorOpen ? "DOOR_OPEN" : "DOOR_CLOSE");
+        publishEvent(isDoorOpen ? "KEYPAD_OPEN" : "KEYPAD_CLOSE");
+
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("MAT KHAU DUNG");
+        lcd.setCursor(0, 1);
+        lcd.print(isDoorOpen ? "MO CUA" : "DONG CUA");
+        delay(2000);
+        lcd.clear();
+      } else {
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("SAI MAT KHAU");
+        lcd.setCursor(0, 1);
+        lcd.print("THU LAI");
+        delay(2000);
+        inputPassword = "";
+        lastCharAddedTime = 0;
+        lcd.clear();
+        displayPasswordInput();
+        return;
+      }
+      isEnteringPassword = false;
+      inputPassword = "";
+    } else if (key != 'A' && key != 'C' && key != 'D') {
+      if (inputPassword.length() < 16) {
+        inputPassword += key;
+        lastCharAddedTime = millis();
+        displayPasswordInput();
+      }
+    }
   }
 }
 
 // ===== HIỂN THỊ LCD CHUYÊN NGHIỆP =====
 void displayLCD() {
+  if (isEnteringPassword) {
+    displayPasswordInput();
+    return;
+  }
+
   // Đổi trang mỗi 5 giây
   if (millis() - lastPageChange >= PAGE_CHANGE_INTERVAL) {
     displayPage = (displayPage + 1) % 3;

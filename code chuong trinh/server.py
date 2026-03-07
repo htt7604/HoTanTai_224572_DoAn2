@@ -71,6 +71,7 @@ MQTT_BROKER = "3c5308fe02794486932d547731382984.s1.eu.hivemq.cloud"
 MQTT_PORT = 8883
 MQTT_TOPIC_SENSOR = "esp32/sensor"
 MQTT_TOPIC_CONTROL = "esp32/control"
+MQTT_TOPIC_EVENTS = "esp32/events"
 
 latest_data = {}
 mqtt_client = None
@@ -96,6 +97,7 @@ previous_state = {
     "light1": False,
     "light2": False,
     "light3": False,
+    "fan": False,
     "rain": False,
     "flame": False,
     "pir": False,
@@ -114,8 +116,9 @@ HUM_CHANGE_THRESHOLD = 5.0   # Độ ẩm thay đổi > 5%
 GAS_CHANGE_THRESHOLD = 50    # Gas thay đổi > 50
 
 def on_connect(client, userdata, flags, rc):
-    print("MQTT connected:", rc)
+    print("[MQTT] Connected:", rc)
     client.subscribe(MQTT_TOPIC_SENSOR)
+    client.subscribe(MQTT_TOPIC_EVENTS)
 
 def save_event(event_type, description, data=None):
     """Lưu sự kiện quan trọng vào MongoDB"""
@@ -152,6 +155,11 @@ def check_and_save_changes(data):
     if data.get("light3") != previous_state["light3"]:
         event_type = "LIGHT3_ON" if data.get("light3") else "LIGHT3_OFF"
         save_event(event_type, f"Đèn 3 {'bật' if data.get('light3') else 'tắt'}", {"light3": data.get("light3")})
+        has_important_change = True
+    
+    if data.get("fan") != previous_state["fan"]:
+        event_type = "FAN_ON" if data.get("fan") else "FAN_OFF"
+        save_event(event_type, f"Quạt {'bật' if data.get('fan') else 'tắt'}", {"fan": data.get("fan")})
         has_important_change = True
     
     # Kiểm tra cảnh báo
@@ -197,6 +205,7 @@ def check_and_save_changes(data):
         "light1": data.get("light1", False),
         "light2": data.get("light2", False),
         "light3": data.get("light3", False),
+        "fan": data.get("fan", False),
         "rain": data.get("rain", False),
         "flame": data.get("flame", False),
         "pir": data.get("pir", False),
@@ -209,8 +218,32 @@ def check_and_save_changes(data):
 
 def on_message(client, userdata, msg):
     global latest_data, last_periodic_save
+    topic = getattr(msg, "topic", "") or ""
     try:
-        data = json.loads(msg.payload.decode())
+        payload = msg.payload.decode()
+        # Xử lý topic esp32/events (RFID, KEYPAD, BUZZER, ROOF_AUTO_CLOSE_RAIN...)
+        if topic == MQTT_TOPIC_EVENTS:
+            try:
+                ev = json.loads(payload) if payload.strip().startswith("{") else {"event": payload.strip()}
+                event_type = ev.get("event", str(ev))
+                desc_map = {
+                    "RFID_OPEN": "RFID mở cửa",
+                    "RFID_CLOSE": "RFID đóng cửa",
+                    "KEYPAD_OPEN": "Keypad mở cửa (mật khẩu đúng)",
+                    "KEYPAD_CLOSE": "Keypad đóng cửa",
+                    "BUZZER_ALARM": "Buzzer báo động kích hoạt",
+                    "HUMAN_DETECTED": "Phát hiện người (PIR)",
+                    "HUMAN_LEFT": "Không còn phát hiện người",
+                    "ROOF_AUTO_CLOSE_RAIN": "Mái tự động đóng do mưa",
+                    "ROOF_AUTO_OPEN": "Mái tự động mở khi hết mưa"
+                }
+                desc = desc_map.get(event_type, str(event_type))
+                save_event(event_type, desc, ev)
+            except Exception as e:
+                print(f"[MQTT] Lỗi xử lý event: {e}")
+            return
+        # Xử lý topic esp32/sensor
+        data = json.loads(payload)
         data["timestamp"] = datetime.now()
         
         # Cập nhật dữ liệu mới nhất
@@ -219,14 +252,14 @@ def on_message(client, userdata, msg):
         # Kiểm tra và lưu sự kiện quan trọng
         has_change = check_and_save_changes(data)
         
-        # Lưu định kỳ (mỗi 5 phút) để có dữ liệu lịch sử
+        # Lưu sensor_data định kỳ mỗi 2 phút
         now = datetime.now()
         if (now - last_periodic_save).total_seconds() >= PERIODIC_SAVE_INTERVAL:
             collection_sensor.insert_one(data.copy())
             last_periodic_save = now
-            print(f"[PERIODIC SAVE] Đã lưu dữ liệu định kỳ lúc {now.strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"[SENSOR] Lưu định kỳ lúc {now.strftime('%Y-%m-%d %H:%M:%S')}")
         
-        # Lưu ngay nếu có sự kiện quan trọng
+        # Lưu sensor_data + device_states khi có sự kiện
         if has_change:
             collection_sensor.insert_one(data.copy())
             # Lưu trạng thái thiết bị khi có thay đổi
@@ -236,24 +269,17 @@ def on_message(client, userdata, msg):
                 "light1": data.get("light1", False),
                 "light2": data.get("light2", False),
                 "light3": data.get("light3", False),
-                "fan": data.get("fan", False) if "fan" in data else None
+                "fan": data.get("fan", False),
+                "roof": data.get("roof", False)
             }
             collection_states.insert_one(state_doc)
         
-        # In thông tin (chỉ khi có thay đổi hoặc debug)
+        # Log khi có thay đổi
         if has_change:
-            print("\n===== SENSOR DATA (CHANGED) =====")
-            print("Temperature:", data.get("temp"))
-            print("Humidity:", data.get("hum"))
-            print("Gas:", data.get("gas"))
-            print("Rain:", data.get("rain"))
-            print("Flame:", data.get("flame"))
-            print("PIR:", data.get("pir"))
-            print("Door:", data.get("door"))
-            print("Light1:", data.get("light1"))
-            print("Light2:", data.get("light2"))
-            print("Light3:", data.get("light3"))
-            print("================================")
+            print(f"[SENSOR] Thay đổi: temp={data.get('temp')} hum={data.get('hum')} gas={data.get('gas')} "
+                  f"rain={data.get('rain')} flame={data.get('flame')} pir={data.get('pir')} "
+                  f"door={data.get('door')} light1={data.get('light1')} light2={data.get('light2')} "
+                  f"light3={data.get('light3')} fan={data.get('fan')}")
 
     except Exception as e:
         print(f"Error processing MQTT message: {e}")
@@ -293,6 +319,7 @@ def log_user_action(command, source, raw_text=None):
     if raw_text:
         doc["text"] = raw_text
     collection_user_actions.insert_one(doc)
+    print(f"[USER ACTION] {command} (source={source})")
 
 def voice_listen_once():
     """Nghe một lần từ microphone và trả về text."""
@@ -530,6 +557,21 @@ def start_wake_word_listener():
     thread = threading.Thread(target=listen_for_wake_word, daemon=True)
     thread.start()
 
+def ai_periodic_learn():
+    """Chạy nền: retrain + learn mỗi giờ"""
+    while True:
+        time.sleep(3600)  # 1 giờ
+        try:
+            ai_engine.retrain_model_if_needed()
+            ai_engine.learn_from_sensor_behavior()
+            ai_engine.learn_patterns()
+        except Exception as e:
+            print(f"[AI] Periodic learn error: {e}")
+
+def start_ai_periodic_learn():
+    t = threading.Thread(target=ai_periodic_learn, daemon=True)
+    t.start()
+
 # ================== API ROUTES ==================
 
 @app.route("/")
@@ -655,6 +697,36 @@ def ai_process():
 
     return jsonify({"error": "MQTT not connected"}), 500
 
+@app.route("/ai/learn", methods=["POST"])
+def ai_learn():
+    """Học từ user_actions + sensor_data và patterns giờ"""
+    try:
+        r1 = ai_engine.learn_from_sensor_behavior()
+        r2 = ai_engine.learn_patterns()
+        return jsonify({
+            "success": True,
+            "sensor_behavior": r1,
+            "patterns": r2
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/ai/retrain", methods=["POST"])
+def ai_retrain():
+    """Retrain model nếu cần (new intents >= 5 hoặc > 24h)"""
+    try:
+        ok = ai_engine.retrain_model_if_needed()
+        return jsonify({"success": True, "retrained": ok})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/ai/context")
+def ai_context():
+    """Lấy ngữ cảnh từ sensor_data mới nhất"""
+    data = latest_data.copy() if latest_data else {}
+    context = ai_engine.detect_context(data)
+    return jsonify({"context": context, "sensor": data})
+
 @app.route("/voice/once", methods=["POST"])
 def voice_once():
     """Thu âm một lần trên server, xử lý và gửi lệnh MQTT."""
@@ -725,7 +797,7 @@ def control_door():
         
         if mqtt_client:
             mqtt_client.publish(MQTT_TOPIC_CONTROL, command)
-            print(f"Sent command: {command}")
+            print(f"[MQTT] Gửi command: {command}")
             log_user_action(command, "control/door")
             return jsonify({"success": True, "command": command})
         else:
@@ -745,7 +817,7 @@ def control_light():
         
         if mqtt_client:
             mqtt_client.publish(MQTT_TOPIC_CONTROL, command)
-            print(f"Sent command: {command}")
+            print(f"[MQTT] Gửi command: {command}")
             log_user_action(command, "control/light")
             return jsonify({"success": True, "command": command})
         else:
@@ -764,7 +836,7 @@ def control_fan():
         
         if mqtt_client:
             mqtt_client.publish(MQTT_TOPIC_CONTROL, command)
-            print(f"Sent command: {command}")
+            print(f"[MQTT] Gửi command: {command}")
             log_user_action(command, "control/fan")
             return jsonify({"success": True, "command": command})
         else:
@@ -783,7 +855,7 @@ def control_roof():
         
         if mqtt_client:
             mqtt_client.publish(MQTT_TOPIC_CONTROL, command)
-            print(f"Sent command: {command}")
+            print(f"[MQTT] Gửi command: {command}")
             log_user_action(command, "control/roof")
             return jsonify({"success": True, "command": command})
         else:
@@ -797,6 +869,7 @@ if __name__ == "__main__":
     print("Initializing MQTT...")
     init_mqtt()
     start_wake_word_listener()
+    start_ai_periodic_learn()
     print("Server started on http://0.0.0.0:5000")
     app.run(host="0.0.0.0", port=5000, debug=False)
     
