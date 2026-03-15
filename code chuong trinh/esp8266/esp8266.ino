@@ -1,35 +1,43 @@
+#if __has_include(<ESP8266Servo.h>)
+#include <ESP8266Servo.h>
+#else
 #include <Servo.h>
+#endif
+#include <Wire.h>
 
 /* ========== SERVO & PIN ========== */
 // Theo sơ đồ nối dây ESP8266 (So_do_noi_day_ESP32_ESP8266_CHUAN_CUOI.docx):
 // Servo cửa → D2 (GPIO4) | 150° đóng – 80° mở
-// Servo mái che → D4 (GPIO2) | 0° đóng – 120° mở
+// Servo mái che → D7 (GPIO13) | 0° đóng – 120° mở
 // Quạt (relay) → D1 (GPIO5)
 #define DOOR_SERVO_PIN 4   // D2 (GPIO4) - Servo cửa
-#define ROOF_SERVO_PIN 2   // D4 (GPIO2) - Servo mái che/rèm
+#define ROOF_SERVO_PIN 13  // D7 (GPIO13) - Servo mái che/rèm
 #define FAN_PIN        5   // D1 (GPIO5) - Quạt relay
 
-/* ========== PIN ĐÈN ========== */
-// Theo sơ đồ nối dây ESP8266:
-// Đèn 1 → D5 (GPIO14)
-// Đèn 2 → D6 (GPIO12)
-// Đèn 3 → D7 (GPIO13)
-// Đèn 4 → D8 (GPIO15) - Có thể thêm nếu cần
-#define LIGHT1_PIN     14  // D5 (GPIO14)
-#define LIGHT2_PIN     12  // D6 (GPIO12)
-#define LIGHT3_PIN     13  // D7 (GPIO13)
-// #define LIGHT4_PIN     15  // D8 (GPIO15) - Chưa sử dụng
+/* ========== PCF8574 (ĐÈN) ========== */
+// Theo sơ đồ nối dây mới:
+// ESP8266 -> PCF8574(3): SDA -> D6, SCL -> D5
+// PCF8574(3) -> ULN2803A: P0->IN1, P1->IN2, P2->IN3, P3->IN4
+// ULN2803A -> Đèn: OUT1->Đèn1, OUT2->Đèn2, OUT3->Đèn3, OUT4->Đèn4
+#define I2C_SDA_PIN     12  // D6 (GPIO12)
+#define I2C_SCL_PIN     14  // D5 (GPIO14)
+#define PCF8574_ADDR 0x20
+
+// ULN2803A thường kích mức HIGH ở chân IN (HIGH = đèn ON).
+// Nếu phần cứng thực tế bị đảo mức, đổi thành 0.
+#define ULN_ACTIVE_HIGH 1
 
 /* ========== GÓC SERVO CHUẨN ========== */
-#define DOOR_CLOSE_ANGLE 150 
-#define DOOR_OPEN_ANGLE  80  
-#define ROOF_CLOSE_ANGLE 0   
-#define ROOF_OPEN_ANGLE  120 
+#define DOOR_CLOSE_ANGLE 80 
+#define DOOR_OPEN_ANGLE  150  
+#define ROOF_CLOSE_ANGLE 120 
+#define ROOF_OPEN_ANGLE  0 
 
 Servo doorServo;
 Servo roofServo;
 
 String command = "";
+const uint8_t COMMAND_MAX_LEN = 40;
 
 /* ========== TRẠNG THÁI ========== */
 bool doorState = false;
@@ -38,6 +46,27 @@ bool fanState = false;
 bool light1State = false;
 bool light2State = false;
 bool light3State = false;
+bool light4State = false;
+
+uint8_t pcfState = 0x00;
+bool pcfFound = false;
+
+bool updatePcfLights() {
+  pcfState = 0x00;
+
+  // Chỉ dùng 4 bit thấp P0..P3 theo đúng mapping relay:
+  // Light1 -> 0x01, Light2 -> 0x02, Light3 -> 0x04, Light4 -> 0x08
+  if (light1State) pcfState |= 0x01;
+  if (light2State) pcfState |= 0x02;
+  if (light3State) pcfState |= 0x04;
+  if (light4State) pcfState |= 0x08;
+
+  pcfState &= 0x0F; // đảm bảo chỉ ghi P0..P3
+
+  Wire.beginTransmission(PCF8574_ADDR);
+  Wire.write(pcfState);
+  return (Wire.endTransmission() == 0);
+}
 
 /* ========== SETUP ========== */
 void setup() {
@@ -49,15 +78,14 @@ void setup() {
 
   // Khởi tạo các chân OUTPUT
   pinMode(FAN_PIN, OUTPUT);
-  pinMode(LIGHT1_PIN, OUTPUT);
-  pinMode(LIGHT2_PIN, OUTPUT);
-  pinMode(LIGHT3_PIN, OUTPUT);
+
+  // Khởi tạo I2C cho PCF8574 điều khiển đèn
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.beginTransmission(PCF8574_ADDR);
+  pcfFound = (Wire.endTransmission() == 0);
 
   // Trạng thái ban đầu - TẤT CẢ TẮT
   digitalWrite(FAN_PIN, LOW);
-  digitalWrite(LIGHT1_PIN, LOW);
-  digitalWrite(LIGHT2_PIN, LOW);
-  digitalWrite(LIGHT3_PIN, LOW);
   
   doorServo.write(DOOR_CLOSE_ANGLE);
   roofServo.write(ROOF_CLOSE_ANGLE);
@@ -68,10 +96,19 @@ void setup() {
   light1State = false;
   light2State = false;
   light3State = false;
+  light4State = false;
+
+  if (!updatePcfLights()) {
+    Serial.println("Warning: PCF8574 write failed in setup");
+  }
 
   delay(500);
   
   Serial.println("ESP8266 initialized!");
+  Serial.print("PCF8574 address: 0x");
+  Serial.println(PCF8574_ADDR, HEX);
+  Serial.print("PCF8574 found: ");
+  Serial.println(pcfFound ? "YES" : "NO");
 }
 
 /* ========== LOOP ========== */
@@ -79,12 +116,18 @@ void loop() {
   while (Serial.available()) {
     char c = Serial.read();
 
-    if (c == '\n') {
+    if (c == '\n' || c == '\r') {
       command.trim();
-      handleCommand(command);
+      if (command.length() > 0) {
+        handleCommand(command);
+      }
       command = "";
-    } else {
-      command += c;
+    } else if (isPrintable(c)) {
+      if (command.length() < COMMAND_MAX_LEN) {
+        command += c;
+      } else {
+        command = "";
+      }
     }
   }
 }
@@ -136,38 +179,82 @@ void handleCommand(String cmd) {
   
   // ===== ĐÈN 1 =====
   else if (cmd == "LIGHT1_ON") {
-    digitalWrite(LIGHT1_PIN, HIGH);
-    light1State = true;
-    Serial.println("Light1: ON");
+    if (!light1State) {
+      light1State = true;
+      if (!updatePcfLights()) Serial.println("PCF write failed: LIGHT1_ON");
+      Serial.println("Light1: ON");
+    } else {
+      Serial.println("Light1: ALREADY ON");
+    }
   }
   else if (cmd == "LIGHT1_OFF") {
-    digitalWrite(LIGHT1_PIN, LOW);
-    light1State = false;
-    Serial.println("Light1: OFF");
+    if (light1State) {
+      light1State = false;
+      if (!updatePcfLights()) Serial.println("PCF write failed: LIGHT1_OFF");
+      Serial.println("Light1: OFF");
+    } else {
+      Serial.println("Light1: ALREADY OFF");
+    }
   }
   
   // ===== ĐÈN 2 =====
   else if (cmd == "LIGHT2_ON") {
-    digitalWrite(LIGHT2_PIN, HIGH);
-    light2State = true;
-    Serial.println("Light2: ON");
+    if (!light2State) {
+      light2State = true;
+      if (!updatePcfLights()) Serial.println("PCF write failed: LIGHT2_ON");
+      Serial.println("Light2: ON");
+    } else {
+      Serial.println("Light2: ALREADY ON");
+    }
   }
   else if (cmd == "LIGHT2_OFF") {
-    digitalWrite(LIGHT2_PIN, LOW);
-    light2State = false;
-    Serial.println("Light2: OFF");
+    if (light2State) {
+      light2State = false;
+      if (!updatePcfLights()) Serial.println("PCF write failed: LIGHT2_OFF");
+      Serial.println("Light2: OFF");
+    } else {
+      Serial.println("Light2: ALREADY OFF");
+    }
   }
   
   // ===== ĐÈN 3 =====
   else if (cmd == "LIGHT3_ON") {
-    digitalWrite(LIGHT3_PIN, HIGH);
-    light3State = true;
-    Serial.println("Light3: ON");
+    if (!light3State) {
+      light3State = true;
+      if (!updatePcfLights()) Serial.println("PCF write failed: LIGHT3_ON");
+      Serial.println("Light3: ON");
+    } else {
+      Serial.println("Light3: ALREADY ON");
+    }
   }
   else if (cmd == "LIGHT3_OFF") {
-    digitalWrite(LIGHT3_PIN, LOW);
-    light3State = false;
-    Serial.println("Light3: OFF");
+    if (light3State) {
+      light3State = false;
+      if (!updatePcfLights()) Serial.println("PCF write failed: LIGHT3_OFF");
+      Serial.println("Light3: OFF");
+    } else {
+      Serial.println("Light3: ALREADY OFF");
+    }
+  }
+
+  // ===== ĐÈN 4 =====
+  else if (cmd == "LIGHT4_ON") {
+    if (!light4State) {
+      light4State = true;
+      if (!updatePcfLights()) Serial.println("PCF write failed: LIGHT4_ON");
+      Serial.println("Light4: ON");
+    } else {
+      Serial.println("Light4: ALREADY ON");
+    }
+  }
+  else if (cmd == "LIGHT4_OFF") {
+    if (light4State) {
+      light4State = false;
+      if (!updatePcfLights()) Serial.println("PCF write failed: LIGHT4_OFF");
+      Serial.println("Light4: OFF");
+    } else {
+      Serial.println("Light4: ALREADY OFF");
+    }
   }
   
   // ===== LỆNH KHÔNG HỢP LỆ =====

@@ -3,11 +3,12 @@
 #include <DHT.h>
 #include <MFRC522.h>
 #include <SPI.h>
-#include <I2CKeyPad.h>
+// #include <I2CKeyPad.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include "mbedtls/sha256.h"
 
 // ================= CẤU HÌNH WIFI =================
 const char* ssid = "P3.15";
@@ -19,6 +20,8 @@ const int mqtt_port = 8883;
 const char* mqtt_topic_sensor = "esp32/sensor";
 const char* mqtt_topic_control = "esp32/control";
 const char* mqtt_topic_events = "esp32/events";
+const char* mqtt_topic_password = "esp32/password";
+const char* mqtt_topic_password_result = "esp32/password/result";
 const char* mqtt_client_id = "ESP32_SmartHome";
 const char* mqtt_username = "esp32";
 const char* mqtt_password = "Esp32123";
@@ -62,7 +65,7 @@ WiFiClientSecure espClient;
 PubSubClient client(espClient);
 
 // ================= KHAI BÁO PIN =================
-#define GAS_PIN    34 
+#define GAS_PIN 34
 #define RAIN_PIN   35 
 #define FLAME_PIN  27 
 #define BUZZER_PIN 15 
@@ -79,16 +82,26 @@ DHT dht(DHTPIN, DHTTYPE);
 
 // ================= I2C =================
 LiquidCrystal_I2C lcd(0x27, 16, 2);
-I2CKeyPad keypad(0x20, &Wire1); 
+// I2CKeyPad keypad(0x20, &Wire1); 
+#define KEYPAD_ADDR 0x20
+
+char keypadMap[4][4] =
+{
+ {'1','2','3','A'},
+ {'4','5','6','B'},
+ {'7','8','9','C'},
+ {'*','0','#','D'}
+};
 
 // ================= MẬT KHẨU =================
-const String PASSWORD = "123456A";
+// const String PASSWORD = "123456A";
 String inputPassword = "";
 bool isEnteringPassword = false;
 unsigned long lastKeyTime = 0;
 unsigned long lastCharAddedTime = 0;  // Thời điểm nhập ký tự cuối (để hiển thị 300ms rồi đổi sang *)
 const unsigned long PASSWORD_TIMEOUT = 10000; // 10 giây timeout
 const unsigned long CHAR_DISPLAY_MS = 300;    // Hiển thị ký tự thật 300ms trước khi đổi thành *
+bool waitingPasswordResult = false;
 
 // ================= BIẾN TRẠNG THÁI =================
 bool isDoorOpen = false;
@@ -99,6 +112,27 @@ bool fanRunning = false;
 bool light1State = false;
 bool light2State = false;
 bool light3State = false;
+bool light4State = false;
+bool passwordAuthSuccessPending = false;
+unsigned long light4ManualOverrideUntil = 0;
+const unsigned long LIGHT4_MANUAL_HOLD_MS = 30000;
+
+// ===== LỌC TRUNG BÌNH CẢM BIẾN GAS =====
+const int GAS_ALERT_THRESHOLD = 1200; // Ngưỡng tối thiểu tuyệt đối (ADC 0..4095)
+const int GAS_ALERT_DELTA = 250;      // Độ lệch so với nền để coi là có gas
+const int GAS_FILTER_SAMPLES = 10;
+int gasSamples[GAS_FILTER_SAMPLES] = {0};
+int gasSampleIndex = 0;
+int gasSampleCount = 0;
+long gasSampleSum = 0;
+int gasAverageValue = 0;
+
+unsigned long gasCalibStart = 0;
+const unsigned long GAS_CALIBRATION_MS = 15000;
+long gasCalibSum = 0;
+int gasCalibCount = 0;
+int gasBaseline = 0;
+bool gasCalibrated = false;
 
 byte lastTouchData = 0xFF;
 
@@ -107,6 +141,32 @@ unsigned long lastLcdUpdate = 0;
 unsigned long lastGasCheck = 0;
 unsigned long lastSensorPublish = 0;
 const unsigned long SENSOR_PUBLISH_INTERVAL = 2000; // 2 giây
+
+// ===== CHỨC NĂNG BUZZER CẢNH BÁO =====
+void shortBeep(unsigned int ms = 150) {
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(ms);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+// ===== LỌC TRUNG BÌNH CẢM BIẾN GAS =====
+int updateGasAverage(int rawValue) {
+  if (gasSampleCount < GAS_FILTER_SAMPLES) {
+    gasSamples[gasSampleCount] = rawValue;
+    gasSampleSum += rawValue;
+    gasSampleCount++;
+  } else {
+    gasSampleSum -= gasSamples[gasSampleIndex];
+    gasSamples[gasSampleIndex] = rawValue;
+    gasSampleSum += rawValue;
+    gasSampleIndex = (gasSampleIndex + 1) % GAS_FILTER_SAMPLES;
+  }
+
+  if (gasSampleCount > 0) {
+    gasAverageValue = (int)(gasSampleSum / gasSampleCount);
+  }
+  return gasAverageValue;
+}
 
 // ===== BIẾN DHT11 =====
 float dhtTemp = NAN;
@@ -168,7 +228,9 @@ void reconnectMQTT() {
     if (client.connect(mqtt_client_id, mqtt_username, mqtt_password)) {
       Serial.println("connected!");
       client.subscribe(mqtt_topic_control);
+      client.subscribe(mqtt_topic_password_result);
       Serial.println("Subscribed to: esp32/control");
+      Serial.println("Subscribed to: esp32/password/result");
       
       lcd.clear();
       lcd.setCursor(0, 0);
@@ -189,7 +251,87 @@ void reconnectMQTT() {
   }
 }
 
+// ===== BẮT ĐẦU CHỨC NĂNG HASH MẬT KHẨU =====
+// ===== SỬA SHA256 CHO ESP32 =====
+String sha256Hex(const String& text) {
+  byte hash[32];
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts(&ctx, 0);
+  mbedtls_sha256_update(&ctx, (const unsigned char*)text.c_str(), text.length());
+  mbedtls_sha256_finish(&ctx, hash);
+  mbedtls_sha256_free(&ctx);
+
+  char hex[65];
+  for (int i = 0; i < 32; i++) {
+    sprintf(&hex[i * 2], "%02x", hash[i]);
+  }
+  hex[64] = '\0';
+  return String(hex);
+}
+
+void handlePasswordAuthResult(bool isOk) {
+  waitingPasswordResult = false;
+
+  if (isOk) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("MAT KHAU DUNG");
+    lcd.setCursor(0, 1);
+    lcd.print("CHO LENH SERVER");
+    delay(2000);
+    lcd.clear();
+
+    isEnteringPassword = false;
+    inputPassword = "";
+    return;
+  }
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("WRONG PASSWORD");
+  lcd.setCursor(0, 1);
+  lcd.print("THU LAI");
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(1000);
+  digitalWrite(BUZZER_PIN, LOW);
+  delay(1000);
+
+  inputPassword = "";
+  lastCharAddedTime = 0;
+  lcd.clear();
+  if (isEnteringPassword) {
+    displayPasswordInput();
+  }
+}
+
+void sendPasswordHashToServer(const String& rawPassword) {
+  if (!client.connected()) {
+    return;
+  }
+
+  String hashHex = sha256Hex(rawPassword);
+
+  StaticJsonDocument<160> doc;
+  doc["type"] = "password_check";
+  doc["hash"] = hashHex;
+
+  char jsonBuffer[160];
+  serializeJson(doc, jsonBuffer);
+  client.publish(mqtt_topic_password, jsonBuffer);
+
+  waitingPasswordResult = true;
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("CHECKING...");
+
+  Serial.print("Published password hash: ");
+  Serial.println(hashHex);
+}
+// ===== KẾT THÚC CHỨC NĂNG HASH MẬT KHẨU =====
+
 void callback(char* topic, byte* payload, unsigned int length) {
+  String topicStr = String(topic);
   String message = "";
   for (int i = 0; i < length; i++) {
     message += (char)payload[i];
@@ -202,6 +344,19 @@ void callback(char* topic, byte* payload, unsigned int length) {
   Serial.print(topic);
   Serial.print("]: ");
   Serial.println(message);
+
+  // ===== BẮT ĐẦU CHỨC NĂNG HASH MẬT KHẨU =====
+  if (topicStr == mqtt_topic_password_result) {
+    if (message == "OK") {
+      passwordAuthSuccessPending = true;
+      handlePasswordAuthResult(true);
+    } else {
+      passwordAuthSuccessPending = false;
+      handlePasswordAuthResult(false);
+    }
+    return;
+  }
+  // ===== KẾT THÚC CHỨC NĂNG HASH MẬT KHẨU =====
   
   // Gửi lệnh cho ESP8266 qua Serial2 để thực hiện
   // Xử lý các lệnh từ server
@@ -209,6 +364,10 @@ void callback(char* topic, byte* payload, unsigned int length) {
     isDoorOpen = true;
     Serial2.println("DOOR_OPEN");  // Gửi cho ESP8266
     Serial.println("Command: DOOR_OPEN -> ESP8266");
+    if (passwordAuthSuccessPending) {
+      shortBeep();
+      passwordAuthSuccessPending = false;
+    }
     lcd.clear();
     lcd.setCursor(0, 0);
     lcd.print("DOOR: OPENED");
@@ -217,6 +376,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
   }
   else if (message == "DOOR_CLOSE") {
     isDoorOpen = false;
+    passwordAuthSuccessPending = false;
     Serial2.println("DOOR_CLOSE");  // Gửi cho ESP8266
     Serial.println("Command: DOOR_CLOSE -> ESP8266");
     lcd.clear();
@@ -254,6 +414,18 @@ void callback(char* topic, byte* payload, unsigned int length) {
     light3State = false;
     Serial2.println("LIGHT3_OFF");  // Gửi cho ESP8266
     Serial.println("Command: LIGHT3_OFF -> ESP8266");
+  }
+  else if (message == "LIGHT4_ON") {
+    light4State = true;
+    light4ManualOverrideUntil = millis() + LIGHT4_MANUAL_HOLD_MS;
+    Serial2.println("LIGHT4_ON");  // Gửi cho ESP8266
+    Serial.println("Command: LIGHT4_ON -> ESP8266");
+  }
+  else if (message == "LIGHT4_OFF") {
+    light4State = false;
+    light4ManualOverrideUntil = millis() + LIGHT4_MANUAL_HOLD_MS;
+    Serial2.println("LIGHT4_OFF");  // Gửi cho ESP8266
+    Serial.println("Command: LIGHT4_OFF -> ESP8266");
   }
   else if (message == "FAN_ON") {
     fanRunning = true;
@@ -307,7 +479,7 @@ void publishSensorData() {
   bool isRaining = (digitalRead(RAIN_PIN) == LOW);
   bool pirDetected = digitalRead(PIR_PIN);
   bool isFire = (digitalRead(FLAME_PIN) == LOW);
-  int gasValue = analogRead(GAS_PIN);
+  int gasValue = gasAverageValue;
   
   // Tạo JSON
   StaticJsonDocument<256> doc;
@@ -321,6 +493,7 @@ void publishSensorData() {
   doc["light1"] = light1State;
   doc["light2"] = light2State;
   doc["light3"] = light3State;
+  doc["light4"] = light4State;
   doc["fan"] = fanRunning;
   
   char jsonBuffer[256];
@@ -335,12 +508,15 @@ void setup() {
   Serial.begin(115200);
   Serial2.begin(9600, SERIAL_8N1, 13, 14);  // Giao tiếp với ESP8266
 
+  analogReadResolution(12);
+  analogSetPinAttenuation(GAS_PIN, ADC_11db);
+
   Wire.begin(32, 33);
   lcd.init();
   lcd.backlight();
 
   Wire1.begin(21, 22);
-  keypad.begin();
+  // keypad.begin();
 
   Wire1.beginTransmission(0x21);
   Wire1.write(0xFF);
@@ -374,6 +550,39 @@ void setup() {
   
   // Kết nối MQTT
   reconnectMQTT();
+
+  gasCalibStart = millis();
+}
+char readKeypad()
+{
+  for(int row=0; row<4; row++)
+  {
+    byte data = 0xFF;
+    data &= ~(1 << row);
+
+    Wire1.beginTransmission(KEYPAD_ADDR);
+    Wire1.write(data);
+    Wire1.endTransmission();
+
+    delayMicroseconds(50);
+
+    Wire1.requestFrom(KEYPAD_ADDR,1);
+
+    if(Wire1.available())
+    {
+      byte colData = Wire1.read();
+
+      for(int col=0; col<4; col++)
+      {
+        if(!(colData & (1 << (col+4))))
+        {
+          return keypadMap[row][col];
+        }
+      }
+    }
+  }
+
+  return 0;
 }
 
 void loop() {
@@ -399,18 +608,45 @@ void loop() {
     }
   }
 
-  // ===== PUBLISH SENSOR DATA MỖI 2 GIÂY =====
-  if (millis() - lastSensorPublish >= SENSOR_PUBLISH_INTERVAL) {
-    publishSensorData();
-    lastSensorPublish = millis();
-  }
-
   // ===== ĐỌC CẢM BIẾN KHÁC =====
   bool isRaining   = (digitalRead(RAIN_PIN) == LOW);
   bool pirDetected = digitalRead(PIR_PIN);
   bool isFire      = (digitalRead(FLAME_PIN) == LOW);
-  int  gasValue    = analogRead(GAS_PIN);
-  bool gasDetected = (gasValue > 400);
+  int  gasRawValue = analogRead(GAS_PIN);
+  int  gasValue    = updateGasAverage(gasRawValue);
+  if (!gasCalibrated) {
+    gasCalibSum += gasValue;
+    gasCalibCount++;
+    if (millis() - gasCalibStart >= GAS_CALIBRATION_MS && gasCalibCount > 0) {
+      gasBaseline = (int)(gasCalibSum / gasCalibCount);
+      gasCalibrated = true;
+      Serial.print("Gas baseline calibrated: ");
+      Serial.println(gasBaseline);
+    }
+  }
+
+  int gasDynamicThreshold = gasCalibrated ? max(GAS_ALERT_THRESHOLD, gasBaseline + GAS_ALERT_DELTA) : GAS_ALERT_THRESHOLD;
+
+  // ===== GAS DETECTION VỚI HYSTERESIS =====
+  // Bật khi gasValue > gasDynamicThreshold
+  // Tắt khi gasValue < gasDynamicThreshold - 150
+  bool gasDetected = lastGasState;
+  if (gasCalibrated) {
+    if (!lastGasState && gasValue > gasDynamicThreshold) {
+      gasDetected = true;
+    } else if (lastGasState && gasValue < (gasDynamicThreshold - 150)) {
+      gasDetected = false;
+    }
+  } else {
+    gasDetected = false;
+  }
+
+  // ===== PUBLISH SENSOR DATA MỖI 2 GIÂY =====
+  // Đặt sau khi đã đọc/cập nhật gas để gửi giá trị mới nhất thay vì mẫu cũ.
+  if (millis() - lastSensorPublish >= SENSOR_PUBLISH_INTERVAL) {
+    publishSensorData();
+    lastSensorPublish = millis();
+  }
 
   // ===== XỬ LÝ MƯA - ĐÓNG RÈM TỰ ĐỘNG =====
   if (isRaining != lastRainState) {
@@ -431,23 +667,33 @@ void loop() {
     if (gasDetected) {
       sendToESP8266("FAN_ON");
       fanRunning = true;
-      Serial.println("Gas phat hien - Bat quat + Buzzer");
+      publishEvent("GAS_DETECTED");
+      Serial.println("Gas detected");
     } else {
       sendToESP8266("FAN_OFF");
       fanRunning = false;
-      Serial.println("Gas binh thuong - Tat quat");
+      publishEvent("GAS_NORMAL");
+      Serial.println("Gas normal");
     }
     lastGasState = gasDetected;
-    lastGasCheck = millis();
   }
 
-  // Kiểm tra gas liên tục khi đang phát hiện
-  if (gasDetected && (millis() - lastGasCheck >= 1000)) {
-    sendToESP8266("FAN_ON"); // Đảm bảo quạt vẫn chạy
-    lastGasCheck = millis();
+  static unsigned long lastGasDebug = 0;
+  if (millis() - lastGasDebug >= 500) {
+    Serial.print("Gas value: ");
+    Serial.print(gasRawValue);
+    Serial.print(" | Avg: ");
+    Serial.print(gasValue);
+    Serial.print(" | Baseline: ");
+    Serial.print(gasBaseline);
+    Serial.print(" | Threshold: ");
+    Serial.print(gasDynamicThreshold);
+    Serial.print(" | Detected: ");
+    Serial.println(gasDetected ? "YES" : "NO");
+    lastGasDebug = millis();
   }
 
-  // ===== BUZZER =====
+  // ===== CHỨC NĂNG BUZZER CẢNH BÁO =====
   if (isFire) {
     digitalWrite(BUZZER_PIN, HIGH);
     if (millis() - lastFireMsg > 3000) {
@@ -456,7 +702,7 @@ void loop() {
       lastFireMsg = millis();
     }
   }
-  else if (gasDetected || pirDetected) {
+  else if (gasDetected) {
     digitalWrite(BUZZER_PIN, HIGH);
   }
   else {
@@ -467,6 +713,13 @@ void loop() {
   if (pirDetected != lastPirState) {
     sendToESP8266(pirDetected ? "HUMAN_DETECTED" : "HUMAN_LEFT");
     publishEvent(pirDetected ? "HUMAN_DETECTED" : "HUMAN_LEFT");
+
+    // ===== TỰ ĐỘNG BẬT ĐÈN KHI PHÁT HIỆN NGƯỜI =====
+    if (millis() > light4ManualOverrideUntil) {
+      light4State = pirDetected;
+      sendToESP8266(pirDetected ? "LIGHT4_ON" : "LIGHT4_OFF");
+    }
+
     lastPirState = pirDetected;
   }
 
@@ -482,6 +735,9 @@ void loop() {
     isDoorOpen = !isDoorOpen;
     sendToESP8266(isDoorOpen ? "DOOR_OPEN" : "DOOR_CLOSE");
     publishEvent(isDoorOpen ? "RFID_OPEN" : "RFID_CLOSE");
+    if (isDoorOpen) {
+      shortBeep();
+    }
     
     lcd.clear();
     lcd.setCursor(0, 0);
@@ -518,9 +774,15 @@ void loop() {
   }
 
   // ===== KEYPAD - MẬT KHẨU =====
-  char key = keypad.getKey();
-  if (key != 0) {
+  // char key = keypad.getKey();
+  // if (key != 0) {
+  //   handleKeypad(key);
+  // }
+  char key = readKeypad();
+  if(key)
+  {
     handleKeypad(key);
+    delay(200); // chống dội phím
   }
 
   // Timeout mật khẩu
@@ -554,6 +816,10 @@ void displayPasswordInput() {
 
 // ===== XỬ LÝ KEYPAD =====
 void handleKeypad(char key) {
+  if (waitingPasswordResult) {
+    return;
+  }
+
   lastKeyTime = millis();
 
   // Phím B - Tắt buzzer và quạt (luôn xử lý)
@@ -572,7 +838,8 @@ void handleKeypad(char key) {
   }
 
   // Bắt đầu nhập mật khẩu khi nhấn phím số đầu tiên (không phải A,B,C,D)
-  if (!isEnteringPassword && key != 'A' && key != 'C' && key != 'D') {
+  // if (!isEnteringPassword && key != 'A' && key != 'C' && key != 'D') {
+  if (!isEnteringPassword) {
     if (key == '*' || key == '#') {
       return;
     }
@@ -590,34 +857,13 @@ void handleKeypad(char key) {
         displayPasswordInput();
       }
     } else if (key == '#') {
-      if (inputPassword == PASSWORD) {
-        isDoorOpen = !isDoorOpen;
-        sendToESP8266(isDoorOpen ? "DOOR_OPEN" : "DOOR_CLOSE");
-        publishEvent(isDoorOpen ? "KEYPAD_OPEN" : "KEYPAD_CLOSE");
-
-        lcd.clear();
-        lcd.setCursor(0, 0);
-        lcd.print("MAT KHAU DUNG");
-        lcd.setCursor(0, 1);
-        lcd.print(isDoorOpen ? "MO CUA" : "DONG CUA");
-        delay(2000);
-        lcd.clear();
-      } else {
-        lcd.clear();
-        lcd.setCursor(0, 0);
-        lcd.print("SAI MAT KHAU");
-        lcd.setCursor(0, 1);
-        lcd.print("THU LAI");
-        delay(2000);
-        inputPassword = "";
-        lastCharAddedTime = 0;
-        lcd.clear();
-        displayPasswordInput();
-        return;
+      if (inputPassword.length() > 0) {
+        // ===== BẮT ĐẦU CHỨC NĂNG HASH MẬT KHẨU =====
+        sendPasswordHashToServer(inputPassword);
+        // ===== KẾT THÚC CHỨC NĂNG HASH MẬT KHẨU =====
       }
-      isEnteringPassword = false;
-      inputPassword = "";
-    } else if (key != 'A' && key != 'C' && key != 'D') {
+    // } else if (key != 'A' && key != 'C' && key != 'D') {
+    }else{
       if (inputPassword.length() < 16) {
         inputPassword += key;
         lastCharAddedTime = millis();
@@ -645,8 +891,8 @@ void displayLCD() {
   bool isRaining = (digitalRead(RAIN_PIN) == LOW);
   bool pirDetected = digitalRead(PIR_PIN);
   bool isFire = (digitalRead(FLAME_PIN) == LOW);
-  int gasValue = analogRead(GAS_PIN);
-  bool gasDetected = (gasValue > 400);
+  int gasValue = gasAverageValue;
+  bool gasDetected = (gasValue > GAS_ALERT_THRESHOLD);
 
   switch (displayPage) {
     case 0: // Trang 1: Nhiệt độ & Độ ẩm
