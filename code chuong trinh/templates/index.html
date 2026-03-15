@@ -314,9 +314,98 @@
             margin-top: 20px;
             font-size: 0.9em;
         }
+
+        .inline-controls {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .select-input {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            font-size: 1em;
+            background: white;
+        }
+
+        .panel-note {
+            margin-top: 8px;
+            color: #555;
+            font-size: 0.9em;
+        }
+
+        .action-lock {
+            position: fixed;
+            inset: 0;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            background: rgba(0, 0, 0, 0.45);
+            z-index: 9999;
+        }
+
+        .action-lock.show {
+            display: flex;
+        }
+
+        .action-lock-box {
+            background: white;
+            color: #333;
+            padding: 18px 24px;
+            border-radius: 12px;
+            font-weight: 600;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+        }
+
+        .toast {
+            position: fixed;
+            right: 20px;
+            bottom: 20px;
+            background: #333;
+            color: white;
+            padding: 12px 16px;
+            border-radius: 10px;
+            box-shadow: 0 6px 16px rgba(0, 0, 0, 0.25);
+            opacity: 0;
+            transform: translateY(12px);
+            transition: opacity 0.25s ease, transform 0.25s ease;
+            z-index: 10000;
+            pointer-events: none;
+            max-width: 360px;
+            font-weight: 600;
+        }
+
+        .toast.show {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        .toast.success {
+            background: #27ae60;
+        }
+
+        .toast.error {
+            background: #e74c3c;
+        }
+
+        body.ui-locked {
+            overflow: hidden;
+        }
+
+        body.ui-locked .container {
+            pointer-events: none;
+            user-select: none;
+        }
     </style>
 </head>
 <body>
+    <div class="action-lock" id="actionLock">
+        <div class="action-lock-box" id="actionLockText">Đang gửi lệnh, vui lòng chờ...</div>
+    </div>
+    <div class="toast" id="appToast"></div>
+
     <div class="container">
         <div class="header">
             <h1>🏠 Smart Home Control System</h1>
@@ -362,11 +451,11 @@
                 <div class="status-value" id="pirValue">--</div>
             </div>
             <div class="status-card">
-                <h3>🚪 Cửa</h3>
+                <h3 id="statusDoorTitle">🚪 Cửa</h3>
                 <div class="status-value" id="doorValue">--</div>
             </div>
             <div class="status-card">
-                <h3>🌀 Quạt</h3>
+                <h3 id="statusFanTitle">🌀 Quạt</h3>
                 <div class="status-value" id="fanValue">--</div>
             </div>
         </div>
@@ -375,9 +464,9 @@
         <div class="control-section">
             <!-- Door Control -->
             <div class="control-panel">
-                <h2>🚪 Điều khiển cửa</h2>
+                <h2 id="doorPanelTitle">🚪 Điều khiển cửa</h2>
                 <div class="control-item">
-                    <label>Mật khẩu mở cửa:</label>
+                    <label id="doorPasswordLabel">Mật khẩu mở cửa:</label>
                     <input type="password" class="password-input" id="doorPassword" placeholder="Nhập mật khẩu (123456A)">
                     <div class="button-group" style="margin-top: 10px;">
                         <button class="btn btn-primary" onclick="openDoor()">Mở cửa</button>
@@ -390,23 +479,30 @@
             <div class="control-panel">
                 <h2>💡 Điều khiển đèn</h2>
                 <div class="control-item">
-                    <label>Đèn 1</label>
+                    <label id="light1Label">Đèn 1</label>
                     <label class="switch">
                         <input type="checkbox" id="light1Switch" onchange="toggleLight(1)">
                         <span class="slider"></span>
                     </label>
                 </div>
                 <div class="control-item">
-                    <label>Đèn 2</label>
+                    <label id="light2Label">Đèn 2</label>
                     <label class="switch">
                         <input type="checkbox" id="light2Switch" onchange="toggleLight(2)">
                         <span class="slider"></span>
                     </label>
                 </div>
                 <div class="control-item">
-                    <label>Đèn 3</label>
+                    <label id="light3Label">Đèn 3</label>
                     <label class="switch">
                         <input type="checkbox" id="light3Switch" onchange="toggleLight(3)">
+                        <span class="slider"></span>
+                    </label>
+                </div>
+                <div class="control-item">
+                    <label id="light4Label">Đèn 4</label>
+                    <label class="switch">
+                        <input type="checkbox" id="light4Switch" onchange="toggleLight(4)">
                         <span class="slider"></span>
                     </label>
                 </div>
@@ -414,20 +510,45 @@
 
             <!-- Fan & Roof Control -->
             <div class="control-panel">
-                <h2>🌀 Điều khiển quạt & mái che</h2>
+                <h2 id="fanRoofPanelTitle">🌀 Điều khiển quạt & mái che</h2>
                 <div class="control-item">
-                    <label>Quạt</label>
+                    <label id="fanControlLabel">Quạt</label>
                     <div class="button-group">
                         <button class="btn btn-success" onclick="controlFan(true)">Bật quạt</button>
                         <button class="btn btn-danger" onclick="controlFan(false)">Tắt quạt</button>
                     </div>
                 </div>
                 <div class="control-item">
-                    <label>Mái che</label>
+                    <label id="roofControlLabel">Mái che</label>
                     <div class="button-group">
                         <button class="btn btn-success" onclick="controlRoof(true)">Mở rèm</button>
                         <button class="btn btn-danger" onclick="controlRoof(false)">Đóng rèm</button>
                     </div>
+                </div>
+            </div>
+
+            <!-- Device Name Config -->
+            <div class="control-panel">
+                <h2>📝 Đặt tên thiết bị</h2>
+                <div class="control-item">
+                    <label>Chọn thiết bị</label>
+                    <select class="select-input" id="deviceKeySelect" onchange="applySelectedDeviceName()">
+                        <option value="door">Cửa</option>
+                        <option value="fan">Quạt</option>
+                        <option value="roof">Mái che</option>
+                        <option value="light1">Đèn 1</option>
+                        <option value="light2">Đèn 2</option>
+                        <option value="light3">Đèn 3</option>
+                        <option value="light4">Đèn 4</option>
+                    </select>
+                </div>
+                <div class="control-item">
+                    <label>Tên người dùng muốn AI đọc</label>
+                    <div class="inline-controls">
+                        <input type="text" class="password-input" id="deviceDisplayName" placeholder="VD: Cửa chính, Đèn phòng khách...">
+                        <button class="btn btn-primary" style="max-width: 140px;" onclick="saveDeviceName()">Lưu tên</button>
+                    </div>
+                    <p class="panel-note" id="deviceNameStatus">Chưa tải tên thiết bị.</p>
                 </div>
             </div>
         </div>
@@ -442,6 +563,82 @@
         let updateInterval;
         let isListening = false;
         let wakeHideTimeout = null;
+        let deviceNameMap = {};
+        let toastHideTimeout = null;
+
+        function showToast(message, type = 'success', duration = 2200) {
+            const toast = document.getElementById('appToast');
+            if (!toast) return;
+
+            if (toastHideTimeout) {
+                clearTimeout(toastHideTimeout);
+                toastHideTimeout = null;
+            }
+
+            toast.textContent = message;
+            toast.className = `toast ${type}`;
+            requestAnimationFrame(() => {
+                toast.classList.add('show');
+            });
+
+            toastHideTimeout = setTimeout(() => {
+                toast.classList.remove('show');
+            }, duration);
+        }
+
+        function setUiLock(locked, message = 'Đang gửi lệnh, vui lòng chờ...') {
+            const lockEl = document.getElementById('actionLock');
+            const lockTextEl = document.getElementById('actionLockText');
+            if (lockTextEl) {
+                lockTextEl.textContent = message;
+            }
+
+            if (locked) {
+                document.body.classList.add('ui-locked');
+                if (lockEl) lockEl.classList.add('show');
+            } else {
+                document.body.classList.remove('ui-locked');
+                if (lockEl) lockEl.classList.remove('show');
+            }
+        }
+
+        async function sendControlRequest(url, payload, successMessage, options = {}) {
+            const { onSuccess, onError } = options;
+            setUiLock(true, 'Đang chờ phản hồi từ thiết bị...');
+            try {
+                const response = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                let result = {};
+                try {
+                    result = await response.json();
+                } catch (e) {
+                    result = {};
+                }
+
+                if (!response.ok || result.success === false) {
+                    throw new Error(result.error || 'Thiết bị chưa phản hồi thành công');
+                }
+
+                if (typeof onSuccess === 'function') {
+                    onSuccess(result);
+                }
+
+                await updateData();
+                setTimeout(updateData, 800);
+                showToast(successMessage, 'success');
+            } catch (error) {
+                if (typeof onError === 'function') {
+                    onError(error);
+                }
+                showToast('Lỗi: ' + error.message, 'error', 2800);
+            } finally {
+                setUiLock(false);
+            }
+        }
 
         function initVoiceButton() {
             const micButton = document.getElementById('micButton');
@@ -481,10 +678,120 @@
         }
 
         // Cập nhật dữ liệu từ server
+        function isDoorOpenState(doorValue) {
+            return doorValue === true || doorValue === 'OPEN' || doorValue === 'open' || doorValue === 1;
+        }
+
+        function applySelectedDeviceName() {
+            const select = document.getElementById('deviceKeySelect');
+            const input = document.getElementById('deviceDisplayName');
+            const key = select.value;
+            input.value = deviceNameMap[key] || '';
+        }
+
+        function getDeviceDisplayName(deviceKey, fallbackText) {
+            return deviceNameMap[deviceKey] || fallbackText;
+        }
+
+        function applyDeviceNamesToUI() {
+            const doorName = getDeviceDisplayName('door', 'Cửa');
+            const fanName = getDeviceDisplayName('fan', 'Quạt');
+            const roofName = getDeviceDisplayName('roof', 'Mái che');
+            const light1Name = getDeviceDisplayName('light1', 'Đèn 1');
+            const light2Name = getDeviceDisplayName('light2', 'Đèn 2');
+            const light3Name = getDeviceDisplayName('light3', 'Đèn 3');
+            const light4Name = getDeviceDisplayName('light4', 'Đèn 4');
+
+            document.getElementById('statusDoorTitle').textContent = `🚪 ${doorName}`;
+            document.getElementById('statusFanTitle').textContent = `🌀 ${fanName}`;
+            document.getElementById('doorPanelTitle').textContent = `🚪 Điều khiển ${doorName.toLowerCase()}`;
+            document.getElementById('doorPasswordLabel').textContent = `Mật khẩu mở ${doorName.toLowerCase()}:`;
+            document.getElementById('light1Label').textContent = light1Name;
+            document.getElementById('light2Label').textContent = light2Name;
+            document.getElementById('light3Label').textContent = light3Name;
+            document.getElementById('light4Label').textContent = light4Name;
+            document.getElementById('fanControlLabel').textContent = fanName;
+            document.getElementById('roofControlLabel').textContent = roofName;
+
+            const optionMap = {
+                door: doorName,
+                fan: fanName,
+                roof: roofName,
+                light1: light1Name,
+                light2: light2Name,
+                light3: light3Name,
+                light4: light4Name,
+            };
+            const select = document.getElementById('deviceKeySelect');
+            for (const option of select.options) {
+                if (optionMap[option.value]) {
+                    option.textContent = optionMap[option.value];
+                }
+            }
+        }
+
+        async function loadDeviceNames() {
+            try {
+                const response = await fetch(`${API_BASE}/devices/names`);
+                const result = await response.json();
+                if (!result || !result.success) {
+                    return;
+                }
+
+                deviceNameMap = {};
+                for (const item of result.items || []) {
+                    if (item.device && item.display_name) {
+                        deviceNameMap[item.device] = item.display_name;
+                    }
+                }
+                applyDeviceNamesToUI();
+                applySelectedDeviceName();
+                document.getElementById('deviceNameStatus').textContent = 'Đã tải tên thiết bị từ MongoDB.';
+            } catch (error) {
+                document.getElementById('deviceNameStatus').textContent = 'Không tải được tên thiết bị.';
+            }
+        }
+
+        async function saveDeviceName() {
+            const device = document.getElementById('deviceKeySelect').value;
+            const displayName = document.getElementById('deviceDisplayName').value.trim();
+            if (!displayName) {
+                showToast('Vui lòng nhập tên thiết bị.', 'error', 2500);
+                return;
+            }
+
+            try {
+                const response = await fetch(`${API_BASE}/devices/names`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        device: device,
+                        display_name: displayName
+                    })
+                });
+
+                const result = await response.json();
+                if (!response.ok || !result.success) {
+                    throw new Error(result.error || 'Lưu tên thiết bị thất bại');
+                }
+
+                deviceNameMap[device] = displayName;
+                applyDeviceNamesToUI();
+                document.getElementById('deviceNameStatus').textContent = `Đã lưu tên cho ${device}: ${displayName}`;
+                showToast('Đã lưu tên thiết bị vào MongoDB!', 'success');
+            } catch (error) {
+                document.getElementById('deviceNameStatus').textContent = `Lỗi: ${error.message}`;
+                showToast('Lỗi lưu tên thiết bị: ' + error.message, 'error', 2800);
+            }
+        }
+
         async function updateData() {
             try {
                 const response = await fetch(`${API_BASE}/sensor/latest`);
                 const data = await response.json();
+
+                console.log("Sensor data:", data);
+                console.log("Gas value:", data.gas);
 
                 if (data.message) {
                     document.getElementById('connectionStatus').textContent = '⚠ Chưa có dữ liệu';
@@ -499,7 +806,8 @@
                 // Cập nhật giá trị cảm biến
                 document.getElementById('tempValue').textContent = data.temp ? data.temp.toFixed(1) + '°C' : '--';
                 document.getElementById('humValue').textContent = data.hum ? data.hum.toFixed(1) + '%' : '--';
-                document.getElementById('gasValue').textContent = data.gas || '--';
+                const gas = data.gas ?? 0;
+                document.getElementById('gasValue').textContent = gas;
                 
                 const rainStatus = data.rain ? 'Có mưa' : 'Không mưa';
                 document.getElementById('rainValue').textContent = rainStatus;
@@ -513,9 +821,10 @@
                 document.getElementById('pirValue').textContent = pirStatus;
                 document.getElementById('pirValue').className = data.pir ? 'status-value alert' : 'status-value safe';
 
-                const doorStatus = data.door === 'OPEN' ? 'MỞ' : 'ĐÓNG';
+                const doorOpen = isDoorOpenState(data.door);
+                const doorStatus = doorOpen ? 'MỞ' : 'ĐÓNG';
                 document.getElementById('doorValue').textContent = doorStatus;
-                document.getElementById('doorValue').className = data.door === 'OPEN' ? 'status-value alert' : 'status-value safe';
+                document.getElementById('doorValue').className = doorOpen ? 'status-value alert' : 'status-value safe';
 
                 const fanStatus = data.fan ? 'BẬT' : 'TẮT';
                 document.getElementById('fanValue').textContent = fanStatus;
@@ -525,6 +834,7 @@
                 document.getElementById('light1Switch').checked = data.light1 || false;
                 document.getElementById('light2Switch').checked = data.light2 || false;
                 document.getElementById('light3Switch').checked = data.light3 || false;
+                document.getElementById('light4Switch').checked = data.light4 || false;
 
                 // Cập nhật thời gian
                 if (data.timestamp) {
@@ -582,88 +892,68 @@
         async function openDoor() {
             const password = document.getElementById('doorPassword').value;
             if (password !== '123456A') {
-                alert('Mật khẩu sai! Mật khẩu đúng là: 123456A');
+                showToast('Mật khẩu sai! Mật khẩu đúng là: 123456A', 'error', 2800);
                 return;
             }
-            try {
-                const response = await fetch(`${API_BASE}/control/door`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ action: 'open' })
-                });
-                if (response.ok) {
-                    alert('Đã gửi lệnh mở cửa!');
-                    document.getElementById('doorPassword').value = '';
+
+            await sendControlRequest(
+                `${API_BASE}/control/door`,
+                { action: 'open' },
+                'Mở cửa thành công!',
+                {
+                    onSuccess: () => {
+                        document.getElementById('doorPassword').value = '';
+                    }
                 }
-            } catch (error) {
-                alert('Lỗi: ' + error.message);
-            }
+            );
         }
 
         // Đóng cửa
         async function closeDoor() {
-            try {
-                const response = await fetch(`${API_BASE}/control/door`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ action: 'close' })
-                });
-                if (response.ok) {
-                    alert('Đã gửi lệnh đóng cửa!');
-                }
-            } catch (error) {
-                alert('Lỗi: ' + error.message);
-            }
+            await sendControlRequest(
+                `${API_BASE}/control/door`,
+                { action: 'close' },
+                'Đóng cửa thành công!'
+            );
         }
 
         // Bật/tắt đèn
         async function toggleLight(lightNum) {
             const isOn = document.getElementById(`light${lightNum}Switch`).checked;
-            try {
-                const response = await fetch(`${API_BASE}/control/light`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ light: lightNum, state: isOn })
-                });
-            } catch (error) {
-                console.error('Error:', error);
-            }
+
+            await sendControlRequest(
+                `${API_BASE}/control/light`,
+                { light: lightNum, state: isOn },
+                `${isOn ? 'Bật' : 'Tắt'} đèn ${lightNum} thành công!`,
+                {
+                    onError: () => {
+                        document.getElementById(`light${lightNum}Switch`).checked = !isOn;
+                    }
+                }
+            );
         }
 
         // Điều khiển quạt
         async function controlFan(on) {
-            try {
-                const response = await fetch(`${API_BASE}/control/fan`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ state: on })
-                });
-                if (response.ok) {
-                    alert(on ? 'Đã bật quạt!' : 'Đã tắt quạt!');
-                }
-            } catch (error) {
-                alert('Lỗi: ' + error.message);
-            }
+            await sendControlRequest(
+                `${API_BASE}/control/fan`,
+                { state: on },
+                on ? 'Bật quạt thành công!' : 'Tắt quạt thành công!'
+            );
         }
 
         // Điều khiển rèm
         async function controlRoof(open) {
-            try {
-                const response = await fetch(`${API_BASE}/control/roof`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ state: open })
-                });
-                if (response.ok) {
-                    alert(open ? 'Đã mở rèm!' : 'Đã đóng rèm!');
-                }
-            } catch (error) {
-                alert('Lỗi: ' + error.message);
-            }
+            await sendControlRequest(
+                `${API_BASE}/control/roof`,
+                { state: open },
+                open ? 'Mở rèm thành công!' : 'Đóng rèm thành công!'
+            );
         }
 
         // Khởi động
         initVoiceButton();
+        loadDeviceNames();
         updateData();
         updateInterval = setInterval(updateData, 2000); // Cập nhật mỗi 2 giây
         setInterval(checkWakeWord, 1000);

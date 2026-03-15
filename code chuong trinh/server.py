@@ -11,6 +11,10 @@ import time
 from ai_engine import SmartHomeAI
 import re
 try:
+    import requests
+except Exception:
+    requests = None
+try:
     import speech_recognition as sr
 except Exception:
     sr = None
@@ -26,12 +30,16 @@ collection_sensor = db["sensor_data"]  # Dữ liệu cảm biến định kỳ
 collection_events = db["events"]  # Sự kiện quan trọng
 collection_states = db["device_states"]  # Trạng thái thiết bị
 collection_user_actions = db["user_actions"]  # Lịch sử điều khiển thiết bị
+collection_ai_alias = db["ai_alias"]  # Alias người dùng đặt cho thiết bị
+collection_device_names = db["device_names"]  # Tên hiển thị thiết bị do người dùng đặt
+collection_mobile_push_tokens = db["mobile_push_tokens"]  # Token FCM từ mobile
 
 # Tạo index cho truy vấn nhanh hơn
 collection_sensor.create_index("timestamp")
 collection_events.create_index("timestamp")
 collection_events.create_index("event_type")
 collection_user_actions.create_index("timestamp")
+collection_mobile_push_tokens.create_index("token", unique=True)
 
 print("MongoDB connected")
 
@@ -72,6 +80,8 @@ MQTT_PORT = 8883
 MQTT_TOPIC_SENSOR = "esp32/sensor"
 MQTT_TOPIC_CONTROL = "esp32/control"
 MQTT_TOPIC_EVENTS = "esp32/events"
+MQTT_TOPIC_PASSWORD = "esp32/password"
+MQTT_TOPIC_PASSWORD_RESULT = "esp32/password/result"
 
 latest_data = {}
 mqtt_client = None
@@ -114,11 +124,73 @@ last_periodic_save = datetime.now()
 TEMP_CHANGE_THRESHOLD = 2.0  # Nhiệt độ thay đổi > 2°C
 HUM_CHANGE_THRESHOLD = 5.0   # Độ ẩm thay đổi > 5%
 GAS_CHANGE_THRESHOLD = 50    # Gas thay đổi > 50
+GAS_ALERT_THRESHOLD = int(os.getenv("GAS_ALERT_THRESHOLD", "1200"))
+FCM_SERVER_KEY = os.getenv("FCM_SERVER_KEY", "").strip()
+FCM_SEND_URL = "https://fcm.googleapis.com/fcm/send"
+
+# ===== BẮT ĐẦU CHỨC NĂNG HASH MẬT KHẨU =====
+PASSWORD_HASH_COLLECTION_CANDIDATES = [
+    "auth",
+    "passwords",
+    "settings",
+    "config"
+]
+
+
+def _normalize_hash(value):
+    if value is None:
+        return None
+    return str(value).strip().lower()
+
+
+def _find_stored_password_hash():
+    # Tìm password_hash ở các collection thường dùng trước.
+    for coll_name in PASSWORD_HASH_COLLECTION_CANDIDATES:
+        doc = db[coll_name].find_one({"password_hash": {"$exists": True}})
+        if doc and doc.get("password_hash"):
+            return _normalize_hash(doc.get("password_hash"))
+
+    # Fallback: quét toàn bộ collection để tìm trường password_hash.
+    for coll_name in db.list_collection_names():
+        doc = db[coll_name].find_one({"password_hash": {"$exists": True}})
+        if doc and doc.get("password_hash"):
+            return _normalize_hash(doc.get("password_hash"))
+    return None
+
+
+def _handle_password_hash_check(payload):
+    if not mqtt_client:
+        return
+
+    try:
+        data = json.loads(payload)
+    except Exception:
+        mqtt_client.publish(MQTT_TOPIC_PASSWORD_RESULT, "FAIL")
+        return
+
+    if data.get("type") != "password_check":
+        mqtt_client.publish(MQTT_TOPIC_PASSWORD_RESULT, "FAIL")
+        return
+
+    incoming_hash = _normalize_hash(data.get("hash"))
+    stored_hash = _find_stored_password_hash()
+    is_valid = bool(incoming_hash and stored_hash and incoming_hash == stored_hash)
+
+    mqtt_client.publish(MQTT_TOPIC_PASSWORD_RESULT, "OK" if is_valid else "FAIL")
+    if is_valid:
+        mqtt_client.publish(MQTT_TOPIC_CONTROL, "DOOR_OPEN")
+    save_event(
+        "PASSWORD_OK" if is_valid else "PASSWORD_FAIL",
+        "Xác thực mật khẩu keypad thành công" if is_valid else "Xác thực mật khẩu keypad thất bại",
+        {"source": "esp32/password"}
+    )
+# ===== KẾT THÚC CHỨC NĂNG HASH MẬT KHẨU =====
 
 def on_connect(client, userdata, flags, rc):
     print("[MQTT] Connected:", rc)
     client.subscribe(MQTT_TOPIC_SENSOR)
     client.subscribe(MQTT_TOPIC_EVENTS)
+    client.subscribe(MQTT_TOPIC_PASSWORD)
 
 def save_event(event_type, description, data=None):
     """Lưu sự kiện quan trọng vào MongoDB"""
@@ -130,6 +202,76 @@ def save_event(event_type, description, data=None):
     }
     collection_events.insert_one(event)
     print(f"[EVENT] {event_type}: {description}")
+
+
+def _get_mobile_push_tokens():
+    docs = list(
+        collection_mobile_push_tokens.find(
+            {},
+            {"_id": 0, "token": 1}
+        )
+    )
+    return [d.get("token", "").strip() for d in docs if d.get("token")]
+
+
+def _remove_mobile_push_token(token):
+    if not token:
+        return
+    collection_mobile_push_tokens.delete_one({"token": token})
+
+
+def send_mobile_push_alert(title, body, data_payload=None):
+    if not FCM_SERVER_KEY:
+        print("[PUSH] Missing FCM_SERVER_KEY, skip push")
+        return
+    if requests is None:
+        print("[PUSH] Missing requests package, skip push")
+        return
+
+    tokens = _get_mobile_push_tokens()
+    if not tokens:
+        print("[PUSH] No mobile tokens registered")
+        return
+
+    headers = {
+        "Authorization": f"key={FCM_SERVER_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    for token in tokens:
+        payload = {
+            "to": token,
+            "priority": "high",
+            "notification": {
+                "title": title,
+                "body": body,
+                "android_channel_id": "smarthome_alerts",
+                "sound": "default"
+            },
+            "data": {
+                "title": title,
+                "body": body,
+                **(data_payload or {})
+            }
+        }
+
+        try:
+            resp = requests.post(FCM_SEND_URL, headers=headers, json=payload, timeout=8)
+            if resp.status_code != 200:
+                print(f"[PUSH] Send failed ({resp.status_code}) for token: {token[:16]}...")
+                continue
+
+            result = resp.json() if resp.text else {}
+            if result.get("failure"):
+                results = result.get("results") or []
+                first_error = (results[0] or {}).get("error") if results else None
+                if first_error in {"InvalidRegistration", "NotRegistered"}:
+                    _remove_mobile_push_token(token)
+                    print(f"[PUSH] Removed invalid token: {token[:16]}...")
+                else:
+                    print(f"[PUSH] Failed for token {token[:16]}... error={first_error}")
+        except Exception as e:
+            print(f"[PUSH] Exception while sending push: {e}")
 
 def check_and_save_changes(data):
     """Kiểm tra thay đổi và lưu sự kiện nếu có"""
@@ -165,6 +307,11 @@ def check_and_save_changes(data):
     # Kiểm tra cảnh báo
     if data.get("flame") and not previous_state["flame"]:
         save_event("FIRE_ALERT", "CẢNH BÁO: Phát hiện lửa!", {"flame": True})
+        send_mobile_push_alert(
+            "🚨 CẢNH BÁO CHÁY",
+            "Phát hiện lửa trong nhà. Hãy kiểm tra ngay!",
+            {"event_type": "FIRE_ALERT"}
+        )
         has_important_change = True
     
     if data.get("rain") != previous_state["rain"]:
@@ -179,10 +326,15 @@ def check_and_save_changes(data):
     
     # Kiểm tra gas vượt ngưỡng
     gas_value = data.get("gas", 0)
-    if gas_value > 400 and previous_state["gas"] <= 400:
+    if gas_value > GAS_ALERT_THRESHOLD and previous_state["gas"] <= GAS_ALERT_THRESHOLD:
         save_event("GAS_ALERT", f"CẢNH BÁO: Phát hiện gas! Giá trị: {gas_value}", {"gas": gas_value})
+        send_mobile_push_alert(
+            "⚠️ CẢNH BÁO GAS",
+            f"Nồng độ gas nguy hiểm: {gas_value}. Hãy xử lý ngay!",
+            {"event_type": "GAS_ALERT", "gas": str(gas_value)}
+        )
         has_important_change = True
-    elif gas_value <= 400 and previous_state["gas"] > 400:
+    elif gas_value <= GAS_ALERT_THRESHOLD and previous_state["gas"] > GAS_ALERT_THRESHOLD:
         save_event("GAS_NORMAL", f"Gas trở về bình thường. Giá trị: {gas_value}", {"gas": gas_value})
         has_important_change = True
     
@@ -221,6 +373,12 @@ def on_message(client, userdata, msg):
     topic = getattr(msg, "topic", "") or ""
     try:
         payload = msg.payload.decode()
+        # ===== BẮT ĐẦU CHỨC NĂNG HASH MẬT KHẨU =====
+        if topic == MQTT_TOPIC_PASSWORD:
+            _handle_password_hash_check(payload)
+            return
+        # ===== KẾT THÚC CHỨC NĂNG HASH MẬT KHẨU =====
+
         # Xử lý topic esp32/events (RFID, KEYPAD, BUZZER, ROOF_AUTO_CLOSE_RAIN...)
         if topic == MQTT_TOPIC_EVENTS:
             try:
@@ -368,6 +526,37 @@ def start_voice_listener():
 #         return f"Tôi đã tắt đèn {light_num}"
 #     return f"Tôi đã thực hiện lệnh {cmd}"
 def describe_command(command: str):
+    def get_device_display_name(device_key: str, fallback_name: str):
+        """Lấy tên thiết bị từ CSDL để AI phản hồi đúng theo tên người dùng đặt."""
+        key = (device_key or "").strip().lower()
+        if not key:
+            return fallback_name
+
+        # 1) Collection chuyên cho tên thiết bị (ưu tiên)
+        doc = collection_device_names.find_one(
+            {"device": key},
+            sort=[("updated_at", -1)]
+        )
+        if not doc:
+            doc = collection_device_names.find_one(
+                {"device_key": key},
+                sort=[("updated_at", -1)]
+            )
+        if doc:
+            display_name = doc.get("display_name") or doc.get("name")
+            if display_name:
+                return str(display_name).strip()
+
+        # 2) Fallback từ alias AI đã dạy (lấy alias mới nhất)
+        alias_doc = collection_ai_alias.find_one(
+            {"device": key, "alias": {"$exists": True, "$ne": ""}},
+            sort=[("updated_at", -1)]
+        )
+        if alias_doc and alias_doc.get("alias"):
+            return str(alias_doc.get("alias")).strip()
+
+        return fallback_name
+
     if not command:
         return "Tôi không hiểu lệnh"
 
@@ -378,28 +567,29 @@ def describe_command(command: str):
     if match:
         number = match.group(1)
         action = match.group(2)
+        light_name = get_device_display_name(f"light{number}", f"đèn {number}")
         if action == "ON":
-            return f"Đã bật đèn {number}"
+            return f"Đã bật {light_name}"
         else:
-            return f"Đã tắt đèn {number}"
+            return f"Đã tắt {light_name}"
 
     # ===== FAN =====
     if command == "FAN_ON":
-        return "Đã bật quạt"
+        return f"Đã bật {get_device_display_name('fan', 'quạt')}"
     if command == "FAN_OFF":
-        return "Đã tắt quạt"
+        return f"Đã tắt {get_device_display_name('fan', 'quạt')}"
 
     # ===== DOOR =====
     if command == "DOOR_OPEN":
-        return "Đã mở cửa"
+        return f"Đã mở {get_device_display_name('door', 'cửa')}"
     if command == "DOOR_CLOSE":
-        return "Đã đóng cửa"
+        return f"Đã đóng {get_device_display_name('door', 'cửa')}"
 
     # ===== ROOF =====
     if command == "ROOF_OPEN":
-        return "Đã mở mái"
+        return f"Đã mở {get_device_display_name('roof', 'mái')}"
     if command == "ROOF_CLOSE":
-        return "Đã đóng mái"
+        return f"Đã đóng {get_device_display_name('roof', 'mái')}"
 
     return "Đã thực hiện lệnh"
 
@@ -578,16 +768,80 @@ def start_ai_periodic_learn():
 def index():
     return render_template("index.html")
 
+
+def _get_device_name_map():
+    """Lấy map tên thiết bị từ MongoDB: {device_key: display_name}."""
+    docs = list(
+        collection_device_names.find(
+            {},
+            {"_id": 0, "device": 1, "display_name": 1}
+        )
+    )
+    result = {}
+    for d in docs:
+        key = _normalize_device_key(d.get("device"))
+        name = (d.get("display_name") or "").strip()
+        if key and name:
+            result[key] = name
+    return result
+
 @app.route("/sensor/latest")
 def get_latest():
+    device_names = _get_device_name_map()
     if latest_data:
         data = latest_data.copy()
         if "_id" in data:
             data["_id"] = str(data["_id"])
         if "timestamp" in data:
             data["timestamp"] = str(data["timestamp"])
+        data["device_names"] = device_names
         return jsonify(data)
-    return jsonify({"message": "No data"})
+    return jsonify({"message": "No data", "device_names": device_names})
+
+
+@app.route("/mobile/bootstrap")
+def mobile_bootstrap():
+    """Trả dữ liệu khởi tạo cho mobile: sensor mới nhất + tên thiết bị."""
+    payload = {
+        "device_names": _get_device_name_map()
+    }
+    if latest_data:
+        sensor = latest_data.copy()
+        if "_id" in sensor:
+            sensor["_id"] = str(sensor["_id"])
+        if "timestamp" in sensor:
+            sensor["timestamp"] = str(sensor["timestamp"])
+        payload["sensor"] = sensor
+    else:
+        payload["sensor"] = {}
+        payload["message"] = "No data"
+    return jsonify(payload)
+
+
+@app.route("/mobile/register-token", methods=["POST"])
+def register_mobile_token():
+    data = request.json or {}
+    token = (data.get("token") or "").strip()
+    platform = (data.get("platform") or "android").strip().lower()
+
+    if not token:
+        return jsonify({"success": False, "error": "token là bắt buộc"}), 400
+
+    collection_mobile_push_tokens.update_one(
+        {"token": token},
+        {
+            "$set": {
+                "platform": platform,
+                "updated_at": datetime.now()
+            },
+            "$setOnInsert": {
+                "created_at": datetime.now()
+            }
+        },
+        upsert=True
+    )
+
+    return jsonify({"success": True})
 
 @app.route("/sensor/history")
 def get_history():
@@ -641,6 +895,60 @@ def get_latest_state():
         state["timestamp"] = str(state["timestamp"])
     return jsonify(state or {})
 
+
+def _normalize_device_key(device: str):
+    return (device or "").strip().lower()
+
+
+# ================== DEVICE NAME ROUTES ==================
+
+@app.route("/devices/names", methods=["GET"])
+def get_device_names():
+    """Lấy danh sách tên thiết bị do người dùng đặt."""
+    docs = list(collection_device_names.find({}, {"_id": 0, "device": 1, "display_name": 1, "updated_at": 1}))
+    # Chuẩn hóa output cho client
+    items = []
+    for d in docs:
+        items.append({
+            "device": d.get("device"),
+            "display_name": d.get("display_name"),
+            "updated_at": str(d.get("updated_at")) if d.get("updated_at") else None
+        })
+    return jsonify({"success": True, "items": items, "map": _get_device_name_map()})
+
+
+@app.route("/devices/names", methods=["POST"])
+def upsert_device_name():
+    """Lưu/cập nhật tên thiết bị để AI đọc theo tên người dùng đặt."""
+    data = request.json or {}
+    device = _normalize_device_key(data.get("device"))
+    display_name = (data.get("display_name") or "").strip()
+
+    if not device or not display_name:
+        return jsonify({"error": "device và display_name là bắt buộc"}), 400
+
+    collection_device_names.update_one(
+        {"device": device},
+        {
+            "$set": {
+                "display_name": display_name,
+                "updated_at": datetime.now()
+            },
+            "$setOnInsert": {
+                "created_at": datetime.now()
+            }
+        },
+        upsert=True
+    )
+
+    return jsonify({
+        "success": True,
+        "item": {
+            "device": device,
+            "display_name": display_name
+        }
+    })
+
 # ================== AI ROUTES ==================
 
 @app.route("/ai/teach-intent", methods=["POST"])
@@ -678,7 +986,7 @@ def ai_teach_rule():
 
 @app.route("/ai/process", methods=["POST"])
 def ai_process():
-    """Xử lý câu lệnh tự nhiên và publish MQTT"""
+    """Xử lý text từ client, publish MQTT và trả câu phản hồi để client đọc."""
     data = request.json or {}
     text = data.get("text", "").strip()
     if not text:
@@ -687,13 +995,23 @@ def ai_process():
     command = ai_engine.process_command(text)
     if not command:
         print(f"[AI] Text='{text}' => no command")
-        return jsonify({"success": False, "message": "Không tìm thấy lệnh phù hợp"})
+        return jsonify({
+            "success": False,
+            "message": "Không tìm thấy lệnh phù hợp",
+            "response_text": "Tôi không hiểu lệnh"
+        })
 
     if mqtt_client:
         mqtt_client.publish(MQTT_TOPIC_CONTROL, command)
         log_user_action(command, "ai/process", raw_text=text)
+        response_text = describe_command(command)
         print(f"[AI] Text='{text}' => command={command}")
-        return jsonify({"success": True, "command": command})
+        return jsonify({
+            "success": True,
+            "text": text,
+            "command": command,
+            "response_text": response_text
+        })
 
     return jsonify({"error": "MQTT not connected"}), 500
 
@@ -729,55 +1047,22 @@ def ai_context():
 
 @app.route("/voice/once", methods=["POST"])
 def voice_once():
-    """Thu âm một lần trên server, xử lý và gửi lệnh MQTT."""
-    if not VOICE_ENABLED:
-        return jsonify({"success": False, "message": "Voice disabled"}), 400
-    voice_priority_event.set()
-    text, error = voice_listen_once()
-    if not text:
-        print(f"[VOICE] Error: {error}")
-        voice_priority_event.clear()
-        return jsonify({"success": False, "message": error or "Không nghe rõ"}), 400
-
-    print(f"[VOICE] Heard: {text}")
-    command = ai_engine.process_command(text)
-    if not command:
-        print(f"[VOICE] No command for text: {text}")
-        voice_priority_event.clear()
-        return jsonify({"success": False, "text": text, "message": "Không hiểu lệnh"}), 200
-
-    if mqtt_client:
-        mqtt_client.publish(MQTT_TOPIC_CONTROL, command)
-        log_user_action(command, "voice", raw_text=text)
-        print(f"[VOICE] Text='{text}' => command={command}")
-        voice_priority_event.clear()
-        return jsonify({"success": True, "text": text, "command": command})
-
-    voice_priority_event.clear()
-    return jsonify({"success": False, "text": text, "message": "MQTT not connected"}), 500
+    """Deprecated: voice capture moved to mobile client."""
+    return jsonify({
+        "success": False,
+        "message": "Server không còn thu âm. Hãy gửi text lên /ai/process từ app mobile."
+    }), 410
 
 
 @app.route("/voice/status")
 def voice_status():
-    global wake_word_detected, wake_word_text
-    global wake_session_active, wake_response_ready, wake_response_text
-    detected = bool(wake_word_detected)
-    text = wake_word_text if detected else ""
-    response_ready = bool(wake_response_ready)
-    response_text = wake_response_text if response_ready else ""
-    active = bool(wake_session_active)
-    if detected:
-        wake_word_detected = False
-        wake_word_text = ""
-    if response_ready:
-        wake_response_ready = False
-        wake_response_text = ""
     return jsonify({
-        "wake_word": detected,
-        "text": text,
-        "active": active,
-        "response_ready": response_ready,
-        "response_text": response_text
+        "wake_word": False,
+        "text": "",
+        "active": False,
+        "response_ready": False,
+        "response_text": "",
+        "message": "Server wake-word listener đã tắt."
     })
 
 # ================== CONTROL ROUTES ==================
@@ -850,7 +1135,6 @@ def control_roof():
     try:
         data = request.json
         state = data.get("state", False)
-        
         command = "ROOF_OPEN" if state else "ROOF_CLOSE"
         
         if mqtt_client:
@@ -868,7 +1152,7 @@ def control_roof():
 if __name__ == "__main__":
     print("Initializing MQTT...")
     init_mqtt()
-    start_wake_word_listener()
+    print("Voice capture mode: client-side (mobile)")
     start_ai_periodic_learn()
     print("Server started on http://0.0.0.0:5000")
     app.run(host="0.0.0.0", port=5000, debug=False)
