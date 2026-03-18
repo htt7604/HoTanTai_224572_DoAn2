@@ -102,6 +102,13 @@ def _sha256_hex(raw_text: str):
     return hashlib.sha256((raw_text or "").encode("utf-8")).hexdigest()
 
 
+def _is_valid_sha256_hex(value: str):
+    if not value:
+        return False
+    text = value.strip().lower()
+    return bool(re.fullmatch(r"[0-9a-f]{64}", text))
+
+
 def _normalize_rfid_uid(value: str):
     raw = (value or "").strip().upper()
     if not raw:
@@ -1440,13 +1447,6 @@ def require_esp32_connection():
 
 def _normalize_username(username: str):
     return (username or "").strip().lower()
-
-
-def _is_valid_sha256_hex(value: str):
-    if not value:
-        return False
-    text = value.strip().lower()
-    return bool(re.fullmatch(r"[0-9a-f]{64}", text))
 
 
 def _resolve_password_hash(payload: dict, password_field: str, hash_field: str):
