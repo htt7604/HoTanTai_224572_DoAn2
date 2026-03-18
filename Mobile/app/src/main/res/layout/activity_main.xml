@@ -39,6 +39,34 @@
                 android:textColor="#58698A"
                 android:textSize="13sp" />
 
+            <Button
+                android:id="@+id/btnOpenHistory"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text="📊 Xem lịch sử thông số" />
+
+            <Button
+                android:id="@+id/btnManageRfid"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="🪪 Tạo/đổi thẻ RFID" />
+
+            <Button
+                android:id="@+id/btnManageDoorPassword"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="🔐 Quản lý mật khẩu cửa" />
+
+            <Button
+                android:id="@+id/btnLogoutMain"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="🚪 Đăng xuất" />
+
             <TextView
                 android:id="@+id/tvConnectionStatus"
                 android:layout_width="wrap_content"
@@ -68,7 +96,7 @@
                 android:layout_height="wrap_content"
                 android:layout_marginTop="6dp"
                 android:background="#FFFFFF"
-                android:hint="http://192.168.1.10:5000"
+                android:hint="Emulator: http://10.0.2.2:5000 | Phone: http://192.168.1.10:5000"
                 android:inputType="textUri"
                 android:padding="12dp"
                 android:textColor="#111111"
@@ -102,6 +130,13 @@
                     android:layout_height="wrap_content"
                     android:layout_marginTop="10dp"
                     android:text="Ra lệnh bằng giọng nói" />
+
+                <Button
+                    android:id="@+id/btnWakeWordToggle"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="Wake word: BẬT (nhà ơi)" />
 
                 <TextView
                     android:id="@+id/tvVoiceStatus"
@@ -402,7 +437,7 @@
                     android:layout_height="wrap_content"
                     android:layout_marginTop="6dp"
                     android:background="#F7F9FD"
-                    android:hint="Nhập mật khẩu (123456A)"
+                    android:hint="Nhập mật khẩu"
                     android:inputType="textPassword"
                     android:padding="10dp"
                     android:textColor="#111111"

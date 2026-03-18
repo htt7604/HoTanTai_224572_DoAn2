@@ -308,6 +308,25 @@
             font-size: 0.95em;
         }
 
+        .header-actions {
+            margin-top: 12px;
+        }
+
+        .header-link {
+            display: inline-block;
+            background: rgba(255, 255, 255, 0.2);
+            color: white;
+            text-decoration: none;
+            border: 1px solid rgba(255, 255, 255, 0.4);
+            border-radius: 8px;
+            padding: 8px 14px;
+            font-weight: 600;
+        }
+
+        .header-link:hover {
+            background: rgba(255, 255, 255, 0.3);
+        }
+
         .last-update {
             text-align: center;
             color: white;
@@ -410,6 +429,11 @@
         <div class="header">
             <h1>🏠 Smart Home Control System</h1>
             <p>Hệ thống điều khiển nhà thông minh</p>
+            <div class="header-actions">
+                <a class="header-link" href="/history">📊 Xem lịch sử thông số</a>
+                <a class="header-link" href="/rfid">🪪 Quản lý thẻ RFID</a>
+                <a class="header-link" href="/door-password/manage">🔐 Mật khẩu mở cửa</a>
+            </div>
             <div class="voice-control">
                 <button class="mic-btn" id="micButton">🎤 Ra lệnh bằng giọng nói</button>
                 <span class="voice-status" id="voiceStatus">Sẵn sàng</span>
@@ -447,7 +471,7 @@
                 <div class="status-value" id="flameValue">--</div>
             </div>
             <div class="status-card">
-                <h3>👤 Chuyển động</h3>
+                <h3>👤 PIR HC-SR501</h3>
                 <div class="status-value" id="pirValue">--</div>
             </div>
             <div class="status-card">
@@ -467,7 +491,7 @@
                 <h2 id="doorPanelTitle">🚪 Điều khiển cửa</h2>
                 <div class="control-item">
                     <label id="doorPasswordLabel">Mật khẩu mở cửa:</label>
-                    <input type="password" class="password-input" id="doorPassword" placeholder="Nhập mật khẩu (123456A)">
+                    <input type="password" class="password-input" id="doorPassword" placeholder="Nhập mật khẩu">
                     <div class="button-group" style="margin-top: 10px;">
                         <button class="btn btn-primary" onclick="openDoor()">Mở cửa</button>
                         <button class="btn btn-danger" onclick="closeDoor()">Đóng cửa</button>
@@ -565,6 +589,48 @@
         let wakeHideTimeout = null;
         let deviceNameMap = {};
         let toastHideTimeout = null;
+        let esp32Connected = false;
+
+        function setControlEnabled(enabled) {
+            const controlSelectors = [
+                '#doorPassword',
+                '#light1Switch',
+                '#light2Switch',
+                '#light3Switch',
+                '#light4Switch',
+                '#micButton',
+                'button[onclick="openDoor()"]',
+                'button[onclick="closeDoor()"]',
+                'button[onclick="controlFan(true)"]',
+                'button[onclick="controlFan(false)"]',
+                'button[onclick="controlRoof(true)"]',
+                'button[onclick="controlRoof(false)"]'
+            ];
+
+            controlSelectors.forEach(selector => {
+                const elements = document.querySelectorAll(selector);
+                elements.forEach(el => {
+                    el.disabled = !enabled;
+                });
+            });
+        }
+
+        function applyConnectionState(connected, message) {
+            esp32Connected = connected;
+            const statusEl = document.getElementById('connectionStatus');
+            if (!statusEl) return;
+
+            if (connected) {
+                statusEl.textContent = '✓ Đã kết nối ESP32';
+                statusEl.className = 'connection-status connected';
+                setControlEnabled(true);
+                return;
+            }
+
+            statusEl.textContent = `✗ ${message || 'ESP32 không kết nối'}`;
+            statusEl.className = 'connection-status disconnected';
+            setControlEnabled(false);
+        }
 
         function showToast(message, type = 'success', duration = 2200) {
             const toast = document.getElementById('appToast');
@@ -604,6 +670,15 @@
 
         async function sendControlRequest(url, payload, successMessage, options = {}) {
             const { onSuccess, onError } = options;
+            if (!esp32Connected) {
+                const err = new Error('ESP32 không kết nối, không thể điều khiển');
+                if (typeof onError === 'function') {
+                    onError(err);
+                }
+                showToast(err.message, 'error', 2800);
+                return;
+            }
+
             setUiLock(true, 'Đang chờ phản hồi từ thiết bị...');
             try {
                 const response = await fetch(url, {
@@ -640,6 +715,13 @@
             }
         }
 
+        async function sha256Hex(text) {
+            const data = new TextEncoder().encode(text || '');
+            const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+            const hashArray = Array.from(new Uint8Array(hashBuffer));
+            return hashArray.map(byte => byte.toString(16).padStart(2, '0')).join('');
+        }
+
         function initVoiceButton() {
             const micButton = document.getElementById('micButton');
             const voiceStatus = document.getElementById('voiceStatus');
@@ -647,6 +729,10 @@
 
             micButton.addEventListener('click', async () => {
                 if (isListening) return;
+                if (!esp32Connected) {
+                    showToast('ESP32 không kết nối, không thể điều khiển bằng giọng nói.', 'error', 2800);
+                    return;
+                }
                 isListening = true;
                 micButton.classList.add('listening');
                 micButton.disabled = true;
@@ -794,14 +880,12 @@
                 console.log("Gas value:", data.gas);
 
                 if (data.message) {
-                    document.getElementById('connectionStatus').textContent = '⚠ Chưa có dữ liệu';
-                    document.getElementById('connectionStatus').className = 'connection-status disconnected';
+                    applyConnectionState(false, data.esp32_status_message || 'Chưa có dữ liệu từ ESP32');
                     return;
                 }
 
                 // Cập nhật trạng thái kết nối
-                document.getElementById('connectionStatus').textContent = '✓ Đã kết nối';
-                document.getElementById('connectionStatus').className = 'connection-status connected';
+                applyConnectionState(data.esp32_connected === true, data.esp32_status_message);
 
                 // Cập nhật giá trị cảm biến
                 document.getElementById('tempValue').textContent = data.temp ? data.temp.toFixed(1) + '°C' : '--';
@@ -817,7 +901,7 @@
                 document.getElementById('flameValue').textContent = flameStatus;
                 document.getElementById('flameValue').className = data.flame ? 'status-value alert' : 'status-value safe';
 
-                const pirStatus = data.pir ? 'Phát hiện' : 'Không có';
+                const pirStatus = data.pir ? 'Có chuyển động' : 'Không chuyển động';
                 document.getElementById('pirValue').textContent = pirStatus;
                 document.getElementById('pirValue').className = data.pir ? 'status-value alert' : 'status-value safe';
 
@@ -844,8 +928,7 @@
 
             } catch (error) {
                 console.error('Error:', error);
-                document.getElementById('connectionStatus').textContent = '✗ Lỗi kết nối';
-                document.getElementById('connectionStatus').className = 'connection-status disconnected';
+                applyConnectionState(false, 'Lỗi kết nối server');
             }
         }
 
@@ -891,14 +974,16 @@
         // Mở cửa
         async function openDoor() {
             const password = document.getElementById('doorPassword').value;
-            if (password !== '123456A') {
-                showToast('Mật khẩu sai! Mật khẩu đúng là: 123456A', 'error', 2800);
+            if (!password || !password.trim()) {
+                showToast('Vui lòng nhập mật khẩu mở cửa.', 'error', 2500);
                 return;
             }
 
+            const passwordHash = await sha256Hex(password.trim());
+
             await sendControlRequest(
-                `${API_BASE}/control/door`,
-                { action: 'open' },
+                `${API_BASE}/door/open-by-password`,
+                { password_hash: passwordHash },
                 'Mở cửa thành công!',
                 {
                     onSuccess: () => {

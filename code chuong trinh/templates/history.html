@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lịch sử cảm biến - Smart Home</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .header {
+            color: white;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+
+        .header h1 {
+            font-size: 2rem;
+            margin-bottom: 8px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.25);
+        }
+
+        .header-actions {
+            margin-top: 14px;
+        }
+
+        .btn {
+            padding: 10px 16px;
+            border: none;
+            border-radius: 8px;
+            font-size: 0.95rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.25s;
+            text-decoration: none;
+            display: inline-block;
+        }
+
+        .btn-primary {
+            background: #667eea;
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #5568d3;
+        }
+
+        .btn-success {
+            background: #27ae60;
+            color: white;
+        }
+
+        .btn-success:hover {
+            background: #229954;
+        }
+
+        .btn-secondary {
+            background: #34495e;
+            color: white;
+        }
+
+        .btn-secondary:hover {
+            background: #2c3e50;
+        }
+
+        .panel {
+            background: white;
+            border-radius: 12px;
+            padding: 18px;
+            box-shadow: 0 6px 18px rgba(0,0,0,0.15);
+            margin-bottom: 18px;
+        }
+
+        .panel h2 {
+            color: #667eea;
+            margin-bottom: 14px;
+            font-size: 1.2rem;
+        }
+
+        .filter-grid {
+            display: grid;
+            grid-template-columns: 170px 1fr auto auto;
+            gap: 12px;
+            align-items: end;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 6px;
+            color: #333;
+            font-weight: 600;
+        }
+
+        .input,
+        .select {
+            width: 100%;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            padding: 10px 12px;
+            font-size: 0.95rem;
+        }
+
+        .input:focus,
+        .select:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .summary {
+            color: #444;
+            font-weight: 600;
+        }
+
+        .table-wrap {
+            overflow-x: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            min-width: 700px;
+        }
+
+        th, td {
+            padding: 10px 12px;
+            border-bottom: 1px solid #eee;
+            text-align: left;
+            font-size: 0.95rem;
+        }
+
+        th {
+            color: #667eea;
+            background: #f8f9ff;
+        }
+
+        tr:hover {
+            background: #f7f8fd;
+        }
+
+        .empty {
+            padding: 16px;
+            color: #666;
+        }
+
+        @media (max-width: 900px) {
+            .filter-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📊 Lịch sử thông số cảm biến</h1>
+            <p>Theo dõi nhiệt độ, độ ẩm, khí gas từ MongoDB</p>
+            <div class="header-actions">
+                <a class="btn btn-primary" href="/">← Quay lại trang điều khiển</a>
+            </div>
+        </div>
+
+        <div class="panel">
+            <h2>Bộ lọc thời gian</h2>
+            <div class="filter-grid">
+                <div>
+                    <label for="periodSelect">Lọc theo</label>
+                    <select id="periodSelect" class="select">
+                        <option value="hour">Giờ</option>
+                        <option value="day" selected>Ngày</option>
+                        <option value="month">Tháng</option>
+                        <option value="year">Năm</option>
+                    </select>
+                </div>
+
+                <div>
+                    <label for="timeValueInput" id="timeLabel">Chọn ngày</label>
+                    <input id="timeValueInput" class="input" type="date">
+                </div>
+
+                <button class="btn btn-success" id="filterButton">Xem dữ liệu</button>
+                <button class="btn btn-secondary" id="latestButton">Mới nhất</button>
+            </div>
+        </div>
+
+        <div class="panel">
+            <h2>Dữ liệu lịch sử</h2>
+            <div class="summary" id="summaryText">Đang tải dữ liệu...</div>
+            <div class="table-wrap" style="margin-top: 10px;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Thời gian</th>
+                            <th>Nhiệt độ (°C)</th>
+                            <th>Độ ẩm (%)</th>
+                            <th>Khí gas</th>
+                        </tr>
+                    </thead>
+                    <tbody id="historyBody">
+                        <tr>
+                            <td colspan="4" class="empty">Đang tải...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = window.location.origin;
+
+        function getNowParts() {
+            const now = new Date();
+            const yyyy = now.getFullYear();
+            const mm = String(now.getMonth() + 1).padStart(2, '0');
+            const dd = String(now.getDate()).padStart(2, '0');
+            const hh = String(now.getHours()).padStart(2, '0');
+            return { yyyy, mm, dd, hh };
+        }
+
+        function setupTimeInputByPeriod() {
+            const period = document.getElementById('periodSelect').value;
+            const input = document.getElementById('timeValueInput');
+            const label = document.getElementById('timeLabel');
+            const now = getNowParts();
+
+            if (period === 'hour') {
+                input.type = 'datetime-local';
+                input.value = `${now.yyyy}-${now.mm}-${now.dd}T${now.hh}:00`;
+                label.textContent = 'Chọn giờ';
+                return;
+            }
+
+            if (period === 'day') {
+                input.type = 'date';
+                input.value = `${now.yyyy}-${now.mm}-${now.dd}`;
+                label.textContent = 'Chọn ngày';
+                return;
+            }
+
+            if (period === 'month') {
+                input.type = 'month';
+                input.value = `${now.yyyy}-${now.mm}`;
+                label.textContent = 'Chọn tháng';
+                return;
+            }
+
+            input.type = 'number';
+            input.min = '2000';
+            input.max = '2100';
+            input.step = '1';
+            input.value = String(now.yyyy);
+            label.textContent = 'Chọn năm';
+        }
+
+        function formatTimestamp(ts) {
+            if (!ts) return '--';
+            const date = new Date(ts);
+            if (Number.isNaN(date.getTime())) return String(ts);
+            return date.toLocaleString('vi-VN');
+        }
+
+        function toNumberDisplay(value, digits = 1) {
+            if (value === null || value === undefined || Number.isNaN(Number(value))) return '--';
+            return Number(value).toFixed(digits);
+        }
+
+        function renderRows(items) {
+            const body = document.getElementById('historyBody');
+            if (!items || items.length === 0) {
+                body.innerHTML = '<tr><td colspan="4" class="empty">Không có dữ liệu trong khoảng lọc.</td></tr>';
+                return;
+            }
+
+            body.innerHTML = items.map(item => {
+                return `
+                    <tr>
+                        <td>${formatTimestamp(item.timestamp)}</td>
+                        <td>${toNumberDisplay(item.temp)}</td>
+                        <td>${toNumberDisplay(item.hum)}</td>
+                        <td>${item.gas ?? '--'}</td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        async function loadLatestData() {
+            const summary = document.getElementById('summaryText');
+            summary.textContent = 'Đang tải dữ liệu mới nhất...';
+            try {
+                const response = await fetch(`${API_BASE}/sensor/history?limit=100`);
+                const result = await response.json();
+                if (!response.ok || !result.success) {
+                    throw new Error(result.error || 'Không tải được dữ liệu');
+                }
+
+                renderRows(result.data || []);
+                summary.textContent = `Hiển thị ${result.count || 0} bản ghi mới nhất.`;
+            } catch (error) {
+                summary.textContent = `Lỗi: ${error.message}`;
+                renderRows([]);
+            }
+        }
+
+        async function loadFilteredData() {
+            const period = document.getElementById('periodSelect').value;
+            const value = document.getElementById('timeValueInput').value;
+            const summary = document.getElementById('summaryText');
+
+            if (!value) {
+                summary.textContent = 'Vui lòng chọn thời gian cần lọc.';
+                return;
+            }
+
+            summary.textContent = 'Đang lọc dữ liệu...';
+            try {
+                const url = new URL(`${API_BASE}/sensor/history`);
+                url.searchParams.set('period', period);
+                url.searchParams.set('value', value);
+                url.searchParams.set('limit', '2000');
+
+                const response = await fetch(url.toString());
+                const result = await response.json();
+
+                if (!response.ok || !result.success) {
+                    throw new Error(result.error || 'Lọc dữ liệu thất bại');
+                }
+
+                renderRows(result.data || []);
+                summary.textContent = `Bộ lọc ${period} = ${value}: ${result.count || 0} bản ghi.`;
+            } catch (error) {
+                summary.textContent = `Lỗi: ${error.message}`;
+                renderRows([]);
+            }
+        }
+
+        document.getElementById('periodSelect').addEventListener('change', setupTimeInputByPeriod);
+        document.getElementById('filterButton').addEventListener('click', loadFilteredData);
+        document.getElementById('latestButton').addEventListener('click', loadLatestData);
+
+        setupTimeInputByPeriod();
+        loadLatestData();
+    </script>
+</body>
+</html>

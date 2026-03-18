@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#EEF2F8">
+
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="20dp"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="🪪 Quản lý thẻ RFID"
+            android:textColor="#1D2A44"
+            android:textSize="26sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/tvRfidCurrent"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:background="#DDE8FF"
+            android:padding="12dp"
+            android:text="Đang tải thẻ hiện tại..."
+            android:textColor="#173A79"
+            android:textSize="14sp" />
+
+        <EditText
+            android:id="@+id/etRfidOld"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
+            android:background="#FFFFFF"
+            android:hint="Mã thẻ cũ (để trống nếu chưa khởi tạo)"
+            android:padding="12dp" />
+
+        <EditText
+            android:id="@+id/etRfidNew"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:background="#FFFFFF"
+            android:hint="Mã thẻ mới (VD: A1B2C3D4)"
+            android:padding="12dp" />
+
+        <Button
+            android:id="@+id/btnRfidSave"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="Lưu thẻ RFID" />
+
+        <Button
+            android:id="@+id/btnRfidBack"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Quay lại" />
+
+        <TextView
+            android:id="@+id/tvRfidStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:background="#DDE8FF"
+            android:padding="12dp"
+            android:text="Nhập thông tin để tạo/đổi thẻ"
+            android:textColor="#173A79"
+            android:textSize="14sp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="Lịch sử quét RFID"
+            android:textColor="#1D2A44"
+            android:textSize="16sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/tvRfidHistory"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:background="#FFFFFF"
+            android:minHeight="140dp"
+            android:padding="12dp"
+            android:text="Đang tải lịch sử quét..."
+            android:textColor="#173A79"
+            android:textSize="13sp" />
+
+    </LinearLayout>
+
+</androidx.constraintlayout.widget.ConstraintLayout>

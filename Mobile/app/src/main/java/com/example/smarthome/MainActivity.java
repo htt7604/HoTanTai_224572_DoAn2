@@ -10,11 +10,14 @@ import android.app.PendingIntent;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.os.Build;
-import android.speech.RecognizerIntent;
-import android.speech.tts.TextToSpeech;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.speech.RecognitionListener;
+import android.speech.RecognizerIntent;
+import android.speech.SpeechRecognizer;
+import android.speech.tts.TextToSpeech;
+import android.speech.tts.UtteranceProgressListener;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.ImageButton;
@@ -41,6 +44,9 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.text.Normalizer;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
@@ -60,10 +66,15 @@ public class MainActivity extends AppCompatActivity {
 
     private static final String PREFS_NAME = "smarthome_prefs";
     private static final String KEY_BASE_URL = "base_url";
-    private static final String DEFAULT_BASE_URL = "http://127.0.0.1:5000";
+    private static final String DEFAULT_BASE_URL = "http://10.0.2.2:5000";
     private static final String KEY_DEVICE_NAMES_JSON = "device_names_json";
-    private static final String DOOR_PASSWORD = "123456A";
+    private static final String KEY_AUTH_PASSWORD_HASH = "auth_password_hash";
+    private static final String KEY_AUTH_REMEMBER = "auth_remember";
+    private static final String KEY_AUTH_LOGGED_IN = "auth_logged_in";
+    private static final String WAKE_WORD = "nha oi";
+    private static final long WAKE_COMMAND_WINDOW_MS = 5000L;
     private static final long POLLING_INTERVAL_MS = 2000L;
+    private static final long WAKE_RESTART_DELAY_MS = 450L;
     private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
         private static final int GAS_DANGER_THRESHOLD = 1200;
         private static final String ALERT_CHANNEL_ID = "smarthome_alerts";
@@ -88,14 +99,51 @@ public class MainActivity extends AppCompatActivity {
     private TextToSpeech textToSpeech;
     private boolean isVoiceListening = false;
     private Button btnVoiceOnce;
+    private Button btnWakeWordToggle;
     private ActivityResultLauncher<Intent> speechToTextLauncher;
     private ActivityResultLauncher<String> requestMicPermissionLauncher;
     private ActivityResultLauncher<String> requestNotificationPermissionLauncher;
+    private SpeechRecognizer wakeWordRecognizer;
+    private Intent wakeWordRecognizerIntent;
+    private boolean wakeWordModeEnabled = true;
+    private boolean wakeListeningActive = false;
+    private boolean awaitingWakeCommand = false;
+    private boolean pendingMicPermissionForWakeMode = false;
+    private boolean isTtsSpeaking = false;
+    private boolean pendingResumeWakeListeningAfterSpeech = false;
+    private boolean pendingStartWakeCommandWindowAfterSpeech = false;
     private boolean wasFlameDanger = false;
     private boolean wasGasDanger = false;
     private long lastDangerNotifyAtMs = 0L;
     private long lastNetworkErrorAtMs = 0L;
     private boolean networkDisconnectedState = false;
+
+    private final Handler wakeWordHandler = new Handler(Looper.getMainLooper());
+    private final Runnable restartWakeWordRunnable = () -> {
+        if (wakeWordModeEnabled) {
+            startContinuousWakeListening();
+        }
+    };
+
+    private final Runnable wakeCommandTimeoutRunnable = () -> {
+        if (!awaitingWakeCommand) {
+            return;
+        }
+        awaitingWakeCommand = false;
+        showWakeCommandTimeoutStatus();
+        scheduleWakeWordRestart(200L);
+    };
+
+    private final Runnable startWakeCommandWindowRunnable = () -> {
+        if (!wakeWordModeEnabled || isVoiceListening) {
+            return;
+        }
+        awaitingWakeCommand = true;
+        showWakeCommandListeningStatus();
+        wakeWordHandler.removeCallbacks(wakeCommandTimeoutRunnable);
+        wakeWordHandler.postDelayed(wakeCommandTimeoutRunnable, WAKE_COMMAND_WINDOW_MS);
+        scheduleWakeWordRestart(80L);
+    };
 
     private final Runnable pollSensorTask = new Runnable() {
         @Override
@@ -152,12 +200,22 @@ public class MainActivity extends AppCompatActivity {
     private boolean light3On = false;
     private boolean light4On = false;
     private boolean hasInitializedLightState = false;
+    private boolean isAuthenticated = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         EdgeToEdge.enable(this);
         setContentView(R.layout.activity_main);
+
+        if (!getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(KEY_AUTH_LOGGED_IN, false)) {
+            Intent intent = new Intent(MainActivity.this, LoginActivity.class);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+            startActivity(intent);
+            finish();
+            return;
+        }
+        isAuthenticated = true;
 
         bindViews();
         initVoiceLaunchers();
@@ -167,6 +225,7 @@ public class MainActivity extends AppCompatActivity {
         setupActions();
         setupDeviceSpinner();
         initTextToSpeech();
+        initWakeWordRecognizer();
         loadSavedBaseUrl();
         registerPushTokenIfPossible();
         loadCachedDeviceNames();
@@ -174,6 +233,7 @@ public class MainActivity extends AppCompatActivity {
         loadDeviceNames();
         fetchLatestSensor();
         startPolling();
+        updateWakeWordToggleUi();
     }
 
     private void initVoiceLaunchers() {
@@ -186,6 +246,7 @@ public class MainActivity extends AppCompatActivity {
                             btnVoiceOnce.setEnabled(true);
                         }
                         tvVoiceStatus.setText("Không nhận được giọng nói.");
+                        maybeResumeWakeWordListening();
                         return;
                     }
 
@@ -196,6 +257,7 @@ public class MainActivity extends AppCompatActivity {
                             btnVoiceOnce.setEnabled(true);
                         }
                         tvVoiceStatus.setText("Không nhận diện được giọng nói.");
+                        maybeResumeWakeWordListening();
                         return;
                     }
 
@@ -209,12 +271,20 @@ public class MainActivity extends AppCompatActivity {
                 new ActivityResultContracts.RequestPermission(),
                 isGranted -> {
                     if (isGranted) {
-                        launchSpeechRecognizer();
+                        if (pendingMicPermissionForWakeMode) {
+                            pendingMicPermissionForWakeMode = false;
+                            startContinuousWakeListening();
+                        } else {
+                            launchSpeechRecognizer();
+                        }
                     } else {
+                        pendingMicPermissionForWakeMode = false;
                         isVoiceListening = false;
                         if (btnVoiceOnce != null) {
                             btnVoiceOnce.setEnabled(true);
                         }
+                        wakeWordModeEnabled = false;
+                        updateWakeWordToggleUi();
                         tvVoiceStatus.setText("Bạn chưa cấp quyền micro.");
                         showError("Cần cấp quyền micro để dùng giọng nói");
                     }
@@ -315,6 +385,10 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void setupActions() {
+        Button btnOpenHistory = findViewById(R.id.btnOpenHistory);
+        Button btnManageRfid = findViewById(R.id.btnManageRfid);
+        Button btnManageDoorPassword = findViewById(R.id.btnManageDoorPassword);
+        Button btnLogoutMain = findViewById(R.id.btnLogoutMain);
         Button btnSaveBaseUrl = findViewById(R.id.btnSaveBaseUrl);
         Button btnDoorOpen = findViewById(R.id.btnDoorOpen);
         Button btnDoorClose = findViewById(R.id.btnDoorClose);
@@ -323,8 +397,26 @@ public class MainActivity extends AppCompatActivity {
         Button btnRoofOpen = findViewById(R.id.btnRoofOpen);
         Button btnRoofClose = findViewById(R.id.btnRoofClose);
         btnVoiceOnce = findViewById(R.id.btnVoiceOnce);
+        btnWakeWordToggle = findViewById(R.id.btnWakeWordToggle);
         Button btnSaveDeviceName = findViewById(R.id.btnSaveDeviceName);
         Button btnRefresh = findViewById(R.id.btnRefresh);
+
+        btnOpenHistory.setOnClickListener(v -> {
+            Intent intent = new Intent(MainActivity.this, HistoryActivity.class);
+            startActivity(intent);
+        });
+
+        btnManageRfid.setOnClickListener(v -> {
+            Intent intent = new Intent(MainActivity.this, RfidCardActivity.class);
+            startActivity(intent);
+        });
+
+        btnManageDoorPassword.setOnClickListener(v -> {
+            Intent intent = new Intent(MainActivity.this, DoorPasswordActivity.class);
+            startActivity(intent);
+        });
+
+        btnLogoutMain.setOnClickListener(v -> logoutUser());
 
         btnSaveBaseUrl.setOnClickListener(v -> {
             saveBaseUrl();
@@ -332,19 +424,59 @@ public class MainActivity extends AppCompatActivity {
             fetchLatestSensor();
         });
 
-        btnDoorOpen.setOnClickListener(v -> openDoorWithPassword());
-        btnDoorClose.setOnClickListener(v -> controlDoor("CLOSE"));
-        btnFanOn.setOnClickListener(v -> controlFan(true));
-        btnFanOff.setOnClickListener(v -> controlFan(false));
-        btnRoofOpen.setOnClickListener(v -> controlRoof(true));
-        btnRoofClose.setOnClickListener(v -> controlRoof(false));
-        btnVoiceOnce.setOnClickListener(v -> voiceOnce());
-        btnSaveDeviceName.setOnClickListener(v -> saveDeviceName());
+        btnDoorOpen.setOnClickListener(v -> {
+            if (!ensureAuthenticated()) return;
+            openDoorWithPassword();
+        });
+        btnDoorClose.setOnClickListener(v -> {
+            if (!ensureAuthenticated()) return;
+            controlDoor("CLOSE");
+        });
+        btnFanOn.setOnClickListener(v -> {
+            if (!ensureAuthenticated()) return;
+            controlFan(true);
+        });
+        btnFanOff.setOnClickListener(v -> {
+            if (!ensureAuthenticated()) return;
+            controlFan(false);
+        });
+        btnRoofOpen.setOnClickListener(v -> {
+            if (!ensureAuthenticated()) return;
+            controlRoof(true);
+        });
+        btnRoofClose.setOnClickListener(v -> {
+            if (!ensureAuthenticated()) return;
+            controlRoof(false);
+        });
+        btnVoiceOnce.setOnClickListener(v -> {
+            if (!ensureAuthenticated()) return;
+            voiceOnce();
+        });
+        btnWakeWordToggle.setOnClickListener(v -> {
+            if (!ensureAuthenticated()) return;
+            toggleWakeWordMode();
+        });
+        btnSaveDeviceName.setOnClickListener(v -> {
+            if (!ensureAuthenticated()) return;
+            saveDeviceName();
+        });
         btnRefresh.setOnClickListener(v -> fetchLatestSensor());
-        btnLight1.setOnClickListener(v -> onLightCardTapped(1));
-        btnLight2.setOnClickListener(v -> onLightCardTapped(2));
-        btnLight3.setOnClickListener(v -> onLightCardTapped(3));
-        btnLight4.setOnClickListener(v -> onLightCardTapped(4));
+        btnLight1.setOnClickListener(v -> {
+            if (!ensureAuthenticated()) return;
+            onLightCardTapped(1);
+        });
+        btnLight2.setOnClickListener(v -> {
+            if (!ensureAuthenticated()) return;
+            onLightCardTapped(2);
+        });
+        btnLight3.setOnClickListener(v -> {
+            if (!ensureAuthenticated()) return;
+            onLightCardTapped(3);
+        });
+        btnLight4.setOnClickListener(v -> {
+            if (!ensureAuthenticated()) return;
+            onLightCardTapped(4);
+        });
 
         spDeviceKey.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener() {
             @Override
@@ -367,6 +499,41 @@ public class MainActivity extends AppCompatActivity {
         ArrayAdapter<String> adapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, names);
         adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
         spDeviceKey.setAdapter(adapter);
+    }
+
+    private boolean ensureAuthenticated() {
+        if (isAuthenticated) {
+            return true;
+        }
+        Toast.makeText(this, "Vui lòng đăng nhập trước", Toast.LENGTH_SHORT).show();
+        setStatus("Bạn cần đăng nhập để điều khiển");
+        return false;
+    }
+
+    private void logoutUser() {
+        isAuthenticated = false;
+        wakeWordModeEnabled = false;
+        updateWakeWordToggleUi();
+        stopContinuousWakeListening();
+        clearRememberedAuth();
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_AUTH_LOGGED_IN, false)
+                .apply();
+        Toast.makeText(this, "Đã đăng xuất", Toast.LENGTH_SHORT).show();
+
+        Intent intent = new Intent(MainActivity.this, LoginActivity.class);
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+        startActivity(intent);
+        finish();
+    }
+
+    private void clearRememberedAuth() {
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .edit()
+                .remove(KEY_AUTH_PASSWORD_HASH)
+                .putBoolean(KEY_AUTH_REMEMBER, false)
+                .apply();
     }
 
     private void loadSavedBaseUrl() {
@@ -402,8 +569,8 @@ public class MainActivity extends AppCompatActivity {
 
     private String getConnectionHint() {
         String baseUrl = getBaseUrl().toLowerCase(Locale.US);
-        if (baseUrl.contains("127.0.0.1") || baseUrl.contains("localhost")) {
-            return " Bạn đang dùng localhost/127.0.0.1. Trên điện thoại thật, hãy đổi Base URL thành IP LAN của máy chạy server (ví dụ: http://192.168.2.84:5000).";
+        if (baseUrl.contains("127.0.0.1") || baseUrl.contains("localhost") || baseUrl.contains("10.0.2.2")) {
+            return " Bạn đang dùng URL cục bộ (localhost/127.0.0.1/10.0.2.2). Nếu chạy trên điện thoại thật, hãy đổi Base URL thành IP LAN của máy chạy server (ví dụ: http://192.168.2.84:5000).";
         }
         return "";
     }
@@ -424,11 +591,65 @@ public class MainActivity extends AppCompatActivity {
 
     private void openDoorWithPassword() {
         String password = etDoorPassword.getText().toString().trim();
-        if (!DOOR_PASSWORD.equals(password)) {
-            showError("Mật khẩu sai! Mật khẩu đúng là: " + DOOR_PASSWORD);
+        if (password.isEmpty()) {
+            showError("Vui lòng nhập mật khẩu mở cửa");
             return;
         }
-        controlDoor("OPEN");
+
+        try {
+            JSONObject body = new JSONObject();
+            body.put("password_hash", sha256Hex(password));
+
+            Request request = new Request.Builder()
+                    .url(getBaseUrl() + "/door/open-by-password")
+                    .post(RequestBody.create(body.toString(), JSON))
+                    .build();
+
+            setStatus("Đang xác thực mật khẩu mở cửa...");
+            httpClient.newCall(request).enqueue(new Callback() {
+                @Override
+                public void onFailure(Call call, IOException e) {
+                    showError("Request failed: " + e.getMessage() + getConnectionHint());
+                }
+
+                @Override
+                public void onResponse(Call call, Response response) throws IOException {
+                    String responseBody = response.body() != null ? response.body().string() : "";
+                    if (!response.isSuccessful()) {
+                        try {
+                            JSONObject err = responseBody.isEmpty() ? new JSONObject() : new JSONObject(responseBody);
+                            showError(err.optString("error", "Sai mật khẩu hoặc server lỗi"));
+                        } catch (Exception e) {
+                            showError("Server error " + response.code());
+                        }
+                        return;
+                    }
+
+                    runOnUiThread(() -> {
+                        etDoorPassword.setText("");
+                        setStatus("Mở cửa thành công, sẽ tự đóng sau 10 giây");
+                        Toast.makeText(MainActivity.this, "Mở cửa thành công", Toast.LENGTH_SHORT).show();
+                        fetchLatestSensor();
+                    });
+                }
+            });
+        } catch (Exception e) {
+            showError("Cannot build door password request: " + e.getMessage());
+        }
+    }
+
+    private static String sha256Hex(String input) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest((input == null ? "" : input).getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder();
+            for (byte b : hash) {
+                sb.append(String.format("%02x", b));
+            }
+            return sb.toString();
+        } catch (Exception e) {
+            return "";
+        }
     }
 
     private void controlDoor(String action) {
@@ -504,10 +725,307 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    private void initWakeWordRecognizer() {
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            wakeWordModeEnabled = false;
+            tvVoiceStatus.setText("Thiết bị không hỗ trợ wake-word listener.");
+            return;
+        }
+
+        wakeWordRecognizerIntent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        wakeWordRecognizerIntent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        wakeWordRecognizerIntent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "vi-VN");
+        wakeWordRecognizerIntent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
+        wakeWordRecognizerIntent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3);
+
+        wakeWordRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
+        wakeWordRecognizer.setRecognitionListener(new RecognitionListener() {
+            @Override
+            public void onReadyForSpeech(Bundle params) {
+            }
+
+            @Override
+            public void onBeginningOfSpeech() {
+            }
+
+            @Override
+            public void onRmsChanged(float rmsdB) {
+            }
+
+            @Override
+            public void onBufferReceived(byte[] buffer) {
+            }
+
+            @Override
+            public void onEndOfSpeech() {
+                wakeListeningActive = false;
+                scheduleWakeWordRestart(WAKE_RESTART_DELAY_MS);
+            }
+
+            @Override
+            public void onError(int error) {
+                wakeListeningActive = false;
+                scheduleWakeWordRestart(WAKE_RESTART_DELAY_MS);
+            }
+
+            @Override
+            public void onResults(Bundle results) {
+                wakeListeningActive = false;
+                String spokenText = extractBestSpeechResult(results);
+                if (!spokenText.isEmpty()) {
+                    handleContinuousSpeechResult(spokenText);
+                    return;
+                }
+                scheduleWakeWordRestart(WAKE_RESTART_DELAY_MS);
+            }
+
+            @Override
+            public void onPartialResults(Bundle partialResults) {
+            }
+
+            @Override
+            public void onEvent(int eventType, Bundle params) {
+            }
+        });
+    }
+
+    private void toggleWakeWordMode() {
+        wakeWordModeEnabled = !wakeWordModeEnabled;
+        awaitingWakeCommand = false;
+
+        if (wakeWordModeEnabled) {
+            startContinuousWakeListening();
+        } else {
+            stopContinuousWakeListening();
+            tvVoiceStatus.setText("Đã tắt chế độ nghe từ khóa.");
+        }
+
+        updateWakeWordToggleUi();
+    }
+
+    private void updateWakeWordToggleUi() {
+        if (btnWakeWordToggle == null) {
+            return;
+        }
+        btnWakeWordToggle.setText(wakeWordModeEnabled
+                ? "Wake word: BẬT (nhà ơi)"
+                : "Wake word: TẮT");
+    }
+
+    private void startContinuousWakeListening() {
+        if (!wakeWordModeEnabled || isVoiceListening || isTtsSpeaking) {
+            return;
+        }
+        if (wakeWordRecognizer == null || wakeWordRecognizerIntent == null) {
+            initWakeWordRecognizer();
+        }
+        if (wakeWordRecognizer == null) {
+            return;
+        }
+
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED) {
+            pendingMicPermissionForWakeMode = true;
+            requestMicPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO);
+            return;
+        }
+
+        if (wakeListeningActive) {
+            return;
+        }
+
+        try {
+            wakeListeningActive = true;
+            wakeWordRecognizer.startListening(wakeWordRecognizerIntent);
+            if (awaitingWakeCommand) {
+                tvVoiceStatus.setText("Đang nghe lệnh sau từ khóa 'nhà ơi'...");
+            } else {
+                tvVoiceStatus.setText("Đang lắng nghe từ khóa 'nhà ơi'...");
+            }
+        } catch (Exception e) {
+            wakeListeningActive = false;
+            scheduleWakeWordRestart(WAKE_RESTART_DELAY_MS);
+        }
+    }
+
+    private void stopContinuousWakeListening() {
+        wakeWordHandler.removeCallbacks(restartWakeWordRunnable);
+        wakeWordHandler.removeCallbacks(wakeCommandTimeoutRunnable);
+        wakeWordHandler.removeCallbacks(startWakeCommandWindowRunnable);
+        awaitingWakeCommand = false;
+        pendingResumeWakeListeningAfterSpeech = false;
+        pendingStartWakeCommandWindowAfterSpeech = false;
+        wakeListeningActive = false;
+        if (wakeWordRecognizer != null) {
+            try {
+                wakeWordRecognizer.cancel();
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    private void pauseWakeListeningForSpeech() {
+        wakeWordHandler.removeCallbacks(restartWakeWordRunnable);
+        wakeListeningActive = false;
+        if (wakeWordRecognizer != null) {
+            try {
+                wakeWordRecognizer.cancel();
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    private void scheduleWakeWordRestart(long delayMs) {
+        wakeWordHandler.removeCallbacks(restartWakeWordRunnable);
+        if (!wakeWordModeEnabled || isVoiceListening || isTtsSpeaking) {
+            return;
+        }
+        wakeWordHandler.postDelayed(restartWakeWordRunnable, delayMs);
+    }
+
+    private void maybeResumeWakeWordListening() {
+        if (!wakeWordModeEnabled) {
+            return;
+        }
+        if (isTtsSpeaking) {
+            pendingResumeWakeListeningAfterSpeech = true;
+            return;
+        }
+        scheduleWakeWordRestart(300L);
+    }
+
+    private String extractBestSpeechResult(Bundle results) {
+        if (results == null) {
+            return "";
+        }
+        ArrayList<String> list = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+        if (list == null || list.isEmpty()) {
+            return "";
+        }
+        return list.get(0) == null ? "" : list.get(0).trim();
+    }
+
+    private String normalizeTextForWakeWord(String text) {
+        if (text == null) {
+            return "";
+        }
+        String normalized = Normalizer.normalize(text, Normalizer.Form.NFD)
+                .replaceAll("\\p{M}+", "")
+                .toLowerCase(Locale.US)
+                .replaceAll("[^a-z0-9\\s]", " ")
+                .replaceAll("\\s+", " ")
+                .trim();
+        return normalized;
+    }
+
+    private boolean containsWakeWord(String text) {
+        String normalized = normalizeTextForWakeWord(text);
+        return normalized.contains(WAKE_WORD) || normalized.startsWith("nha oi ");
+    }
+
+    private void handleContinuousSpeechResult(String spokenText) {
+        if (awaitingWakeCommand) {
+            awaitingWakeCommand = false;
+            wakeWordHandler.removeCallbacks(wakeCommandTimeoutRunnable);
+            wakeWordHandler.removeCallbacks(startWakeCommandWindowRunnable);
+            tvVoiceStatus.setText("Đã nghe lệnh: " + spokenText);
+            isVoiceListening = true;
+            processVoiceTextOnServer(spokenText);
+            return;
+        }
+
+        if (containsWakeWord(spokenText)) {
+            awaitingWakeCommand = false;
+            tvVoiceStatus.setText("Đang gửi wake-word lên server...");
+            wakeWordHandler.removeCallbacks(wakeCommandTimeoutRunnable);
+            wakeWordHandler.removeCallbacks(startWakeCommandWindowRunnable);
+            requestWakeReplyFromServer(spokenText);
+            return;
+        }
+
+        scheduleWakeWordRestart(WAKE_RESTART_DELAY_MS);
+    }
+
+    private void showWakeCommandTimeoutStatus() {
+        runOnUiThread(() -> {
+            if (tvVoiceStatus != null) {
+                tvVoiceStatus.setText("Hết 5 giây chờ lệnh, quay lại nghe từ khóa 'nhà ơi'.");
+            }
+        });
+    }
+
+    private void showWakeCommandListeningStatus() {
+        runOnUiThread(() -> {
+            if (tvVoiceStatus != null) {
+                tvVoiceStatus.setText("Mời bạn nói lệnh trong 5 giây...");
+            }
+        });
+    }
+
+    private void requestWakeReplyFromServer(String spokenWakeText) {
+        try {
+            JSONObject body = new JSONObject();
+            body.put("text", spokenWakeText == null ? "nhà ơi" : spokenWakeText);
+
+            Request request = new Request.Builder()
+                    .url(getBaseUrl() + "/ai/wake")
+                    .post(RequestBody.create(body.toString(), JSON))
+                    .build();
+
+            httpClient.newCall(request).enqueue(new Callback() {
+                @Override
+                public void onFailure(Call call, IOException e) {
+                    runOnUiThread(() -> {
+                        awaitingWakeCommand = false;
+                        tvVoiceStatus.setText("Không kết nối được server cho wake-word: " + e.getMessage() + getConnectionHint());
+                        scheduleWakeWordRestart(WAKE_RESTART_DELAY_MS);
+                    });
+                }
+
+                @Override
+                public void onResponse(Call call, Response response) throws IOException {
+                    String responseBody = response.body() != null ? response.body().string() : "";
+                    runOnUiThread(() -> {
+                        if (!response.isSuccessful()) {
+                            awaitingWakeCommand = false;
+                            tvVoiceStatus.setText("Server wake-word lỗi: " + response.code());
+                            scheduleWakeWordRestart(WAKE_RESTART_DELAY_MS);
+                            return;
+                        }
+
+                        try {
+                            JSONObject data = responseBody.isEmpty() ? new JSONObject() : new JSONObject(responseBody);
+                            String responseText = data.optString("response_text", "").trim();
+                            if (responseText.isEmpty()) {
+                                awaitingWakeCommand = false;
+                                tvVoiceStatus.setText("Server chưa trả lời wake-word.");
+                                scheduleWakeWordRestart(WAKE_RESTART_DELAY_MS);
+                                return;
+                            }
+                            tvVoiceStatus.setText(responseText);
+                            pendingStartWakeCommandWindowAfterSpeech = true;
+                            speakOnClient(responseText);
+                        } catch (Exception e) {
+                            awaitingWakeCommand = false;
+                            tvVoiceStatus.setText("Lỗi parse phản hồi wake-word từ server");
+                            scheduleWakeWordRestart(WAKE_RESTART_DELAY_MS);
+                        }
+                    });
+                }
+            });
+        } catch (Exception e) {
+            awaitingWakeCommand = false;
+            tvVoiceStatus.setText("Lỗi tạo request wake-word: " + e.getMessage());
+            scheduleWakeWordRestart(WAKE_RESTART_DELAY_MS);
+        }
+    }
+
     private void voiceOnce() {
         if (isVoiceListening) {
             return;
         }
+
+        stopContinuousWakeListening();
 
         isVoiceListening = true;
         tvVoiceStatus.setText("Đang nghe trên điện thoại...");
@@ -539,6 +1057,7 @@ public class MainActivity extends AppCompatActivity {
             }
             tvVoiceStatus.setText("Thiết bị không hỗ trợ nhận dạng giọng nói.");
             showError("Không mở được nhận dạng giọng nói: " + e.getMessage());
+            maybeResumeWakeWordListening();
         }
     }
 
@@ -561,6 +1080,7 @@ public class MainActivity extends AppCompatActivity {
                             btnVoiceOnce.setEnabled(true);
                         }
                         tvVoiceStatus.setText("Lỗi gửi text lên server: " + e.getMessage() + getConnectionHint());
+                        maybeResumeWakeWordListening();
                     });
                 }
 
@@ -579,20 +1099,17 @@ public class MainActivity extends AppCompatActivity {
                             if (data.optBoolean("success", false)) {
                                 String command = data.optString("command", "");
                                 tvVoiceStatus.setText("Đã gửi lệnh: " + command);
-                                if (!replyText.isEmpty()) {
-                                    speakOnClient(replyText);
-                                }
+                                speakOnClient(replyText.isEmpty() ? "Đã thực hiện lệnh" : replyText);
                                 fetchLatestSensor();
                             } else {
                                 String message = data.optString("message", "Không nhận diện được lệnh");
                                 tvVoiceStatus.setText(message);
-                                if (!replyText.isEmpty()) {
-                                    speakOnClient(replyText);
-                                }
                             }
                         } catch (Exception e) {
                             tvVoiceStatus.setText("Lỗi parse phản hồi server");
                         }
+
+                        maybeResumeWakeWordListening();
                     });
                 }
             });
@@ -602,6 +1119,7 @@ public class MainActivity extends AppCompatActivity {
                 btnVoiceOnce.setEnabled(true);
             }
             showError("Không thể tạo request giọng nói: " + e.getMessage());
+            maybeResumeWakeWordListening();
         }
     }
 
@@ -609,6 +1127,37 @@ public class MainActivity extends AppCompatActivity {
         textToSpeech = new TextToSpeech(this, status -> {
             if (status == TextToSpeech.SUCCESS) {
                 textToSpeech.setLanguage(new Locale("vi", "VN"));
+                textToSpeech.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+                    @Override
+                    public void onStart(String utteranceId) {
+                    }
+
+                    @Override
+                    public void onDone(String utteranceId) {
+                        runOnUiThread(() -> {
+                            isTtsSpeaking = false;
+                            if (pendingStartWakeCommandWindowAfterSpeech) {
+                                pendingStartWakeCommandWindowAfterSpeech = false;
+                                wakeWordHandler.post(startWakeCommandWindowRunnable);
+                            } else if (pendingResumeWakeListeningAfterSpeech) {
+                                pendingResumeWakeListeningAfterSpeech = false;
+                                scheduleWakeWordRestart(250L);
+                            }
+                        });
+                    }
+
+                    @Override
+                    public void onError(String utteranceId) {
+                        runOnUiThread(() -> {
+                            isTtsSpeaking = false;
+                            pendingStartWakeCommandWindowAfterSpeech = false;
+                            if (pendingResumeWakeListeningAfterSpeech) {
+                                pendingResumeWakeListeningAfterSpeech = false;
+                            }
+                            scheduleWakeWordRestart(250L);
+                        });
+                    }
+                });
             }
         });
     }
@@ -617,6 +1166,8 @@ public class MainActivity extends AppCompatActivity {
         if (textToSpeech == null || text == null || text.trim().isEmpty()) {
             return;
         }
+        pauseWakeListeningForSpeech();
+        isTtsSpeaking = true;
         textToSpeech.speak(text, TextToSpeech.QUEUE_FLUSH, null, "smarthome_voice_reply");
     }
 
@@ -1151,9 +1702,31 @@ public class MainActivity extends AppCompatActivity {
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        maybeResumeWakeWordListening();
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        stopContinuousWakeListening();
+    }
+
+    @Override
     protected void onDestroy() {
         super.onDestroy();
         pollingHandler.removeCallbacks(pollSensorTask);
+        wakeWordHandler.removeCallbacks(restartWakeWordRunnable);
+        wakeWordHandler.removeCallbacks(wakeCommandTimeoutRunnable);
+        wakeWordHandler.removeCallbacks(startWakeCommandWindowRunnable);
+        if (wakeWordRecognizer != null) {
+            try {
+                wakeWordRecognizer.destroy();
+            } catch (Exception ignored) {
+            }
+            wakeWordRecognizer = null;
+        }
         if (textToSpeech != null) {
             textToSpeech.stop();
             textToSpeech.shutdown();

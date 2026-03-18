@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Quản lý thẻ RFID</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container { max-width: 860px; margin: 0 auto; }
+        .header { color: white; text-align: center; margin-bottom: 20px; }
+        .header h1 { font-size: 2rem; margin-bottom: 8px; }
+        .panel {
+            background: white;
+            border-radius: 14px;
+            padding: 18px;
+            box-shadow: 0 6px 18px rgba(0,0,0,0.15);
+            margin-bottom: 16px;
+        }
+        .panel h2 { color: #667eea; margin-bottom: 12px; }
+        .grid { display: grid; grid-template-columns: 1fr; gap: 10px; }
+        .input {
+            width: 100%;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            padding: 11px 12px;
+            font-size: 0.95rem;
+        }
+        .input:focus { outline: none; border-color: #667eea; }
+        .btn {
+            border: none;
+            border-radius: 8px;
+            padding: 11px 14px;
+            font-weight: 700;
+            cursor: pointer;
+            color: white;
+        }
+        .btn-primary { background: #667eea; }
+        .btn-primary:hover { background: #5568d3; }
+        .btn-secondary { background: #34495e; }
+        .btn-secondary:hover { background: #2c3e50; }
+        .status-box {
+            background: #f1f4ff;
+            color: #1f3768;
+            border-radius: 10px;
+            padding: 10px 12px;
+            font-weight: 600;
+            margin-top: 10px;
+        }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { text-align: left; padding: 10px; border-bottom: 1px solid #eee; }
+        th { color: #667eea; background: #f8f9ff; }
+        .top-actions { text-align: center; margin-top: 8px; }
+        .top-actions a {
+            color: white;
+            text-decoration: none;
+            border: 1px solid rgba(255,255,255,0.5);
+            border-radius: 8px;
+            padding: 8px 12px;
+            display: inline-block;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🪪 Quản lý thẻ RFID</h1>
+            <p>Tạo thẻ mới / thay đổi thẻ giống luồng tạo tài khoản</p>
+            <div class="top-actions"><a href="/">← Quay lại trang điều khiển</a></div>
+        </div>
+
+        <div class="panel">
+            <h2>Thẻ hiện tại</h2>
+            <div class="status-box" id="cardStatus">Đang tải...</div>
+        </div>
+
+        <div class="panel">
+            <h2>Tạo hoặc đổi thẻ RFID</h2>
+            <div class="grid">
+                <input id="oldUid" class="input" placeholder="Mã thẻ cũ (để trống nếu chưa khởi tạo)">
+                <input id="newUid" class="input" placeholder="Mã thẻ mới (ví dụ: A1B2C3D4)">
+                <button class="btn btn-primary" id="btnSave">Lưu thẻ RFID</button>
+                <div class="status-box" id="saveStatus">Nhập thông tin để tạo/đổi thẻ.</div>
+            </div>
+        </div>
+
+        <div class="panel">
+            <h2>Lịch sử quét RFID</h2>
+            <button class="btn btn-secondary" id="btnRefresh">Làm mới lịch sử</button>
+            <div style="overflow-x:auto; margin-top:10px;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Thời gian</th>
+                            <th>Mã thẻ</th>
+                            <th>Trạng thái</th>
+                            <th>Nguồn</th>
+                        </tr>
+                    </thead>
+                    <tbody id="scanBody">
+                        <tr><td colspan="4">Đang tải...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = window.location.origin;
+
+        function normalizeUid(text) {
+            return (text || '').toUpperCase().replace(/[^0-9A-F]/g, '');
+        }
+
+        async function loadCard() {
+            try {
+                const response = await fetch(`${API_BASE}/rfid/card`);
+                const result = await response.json();
+                if (!result.success) throw new Error(result.error || 'Không tải được thẻ');
+                const status = document.getElementById('cardStatus');
+                if (!result.is_initialized) {
+                    status.textContent = 'Chưa khởi tạo thẻ RFID. Lần quét đầu hoặc tạo thủ công sẽ được chấp nhận.';
+                    return;
+                }
+                status.textContent = `Mã hiện tại: ${result.uid} | Cập nhật: ${result.updated_at || '--'}`;
+            } catch (error) {
+                document.getElementById('cardStatus').textContent = 'Lỗi: ' + error.message;
+            }
+        }
+
+        async function saveCard() {
+            const oldUid = normalizeUid(document.getElementById('oldUid').value);
+            const newUid = normalizeUid(document.getElementById('newUid').value);
+            const status = document.getElementById('saveStatus');
+
+            if (!newUid) {
+                status.textContent = 'Vui lòng nhập mã thẻ mới.';
+                return;
+            }
+
+            status.textContent = 'Đang lưu...';
+            try {
+                const response = await fetch(`${API_BASE}/rfid/card`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ old_uid: oldUid, new_uid: newUid })
+                });
+                const result = await response.json();
+                if (!response.ok || !result.success) throw new Error(result.error || 'Lưu thất bại');
+
+                status.textContent = result.mode === 'initialize'
+                    ? `Khởi tạo thẻ thành công: ${result.uid}`
+                    : `Đổi thẻ thành công: ${result.uid}`;
+
+                document.getElementById('oldUid').value = '';
+                document.getElementById('newUid').value = '';
+                await loadCard();
+                await loadScans();
+            } catch (error) {
+                status.textContent = 'Lỗi: ' + error.message;
+            }
+        }
+
+        async function loadScans() {
+            try {
+                const response = await fetch(`${API_BASE}/rfid/scans?limit=40`);
+                const result = await response.json();
+                if (!result.success) throw new Error(result.error || 'Không tải được lịch sử');
+
+                const body = document.getElementById('scanBody');
+                if (!result.items || result.items.length === 0) {
+                    body.innerHTML = '<tr><td colspan="4">Chưa có dữ liệu quét.</td></tr>';
+                    return;
+                }
+
+                body.innerHTML = result.items.map(item => `
+                    <tr>
+                        <td>${item.timestamp || '--'}</td>
+                        <td>${item.uid || '--'}</td>
+                        <td>${item.status || '--'}</td>
+                        <td>${item.source || '--'}</td>
+                    </tr>
+                `).join('');
+            } catch (error) {
+                document.getElementById('scanBody').innerHTML = `<tr><td colspan="4">Lỗi: ${error.message}</td></tr>`;
+            }
+        }
+
+        document.getElementById('btnSave').addEventListener('click', saveCard);
+        document.getElementById('btnRefresh').addEventListener('click', loadScans);
+
+        loadCard();
+        loadScans();
+    </script>
+</body>
+</html>

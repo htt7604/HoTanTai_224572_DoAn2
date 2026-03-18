@@ -22,6 +22,8 @@ const char* mqtt_topic_control = "esp32/control";
 const char* mqtt_topic_events = "esp32/events";
 const char* mqtt_topic_password = "esp32/password";
 const char* mqtt_topic_password_result = "esp32/password/result";
+const char* mqtt_topic_rfid = "esp32/rfid";
+const char* mqtt_topic_rfid_result = "esp32/rfid/result";
 const char* mqtt_client_id = "ESP32_SmartHome";
 const char* mqtt_username = "esp32";
 const char* mqtt_password = "Esp32123";
@@ -69,7 +71,8 @@ PubSubClient client(espClient);
 #define RAIN_PIN   35 
 #define FLAME_PIN  27 
 #define BUZZER_PIN 15 
-#define PIR_PIN    17   // PIR
+#define PIR_PIN    17   // PIR HC-SR501
+const uint8_t PIR_ACTIVE_LEVEL = HIGH;
 
 #define SS_PIN     5
 #define RST_PIN    4
@@ -94,7 +97,6 @@ char keypadMap[4][4] =
 };
 
 // ================= MẬT KHẨU =================
-// const String PASSWORD = "123456A";
 String inputPassword = "";
 bool isEnteringPassword = false;
 unsigned long lastKeyTime = 0;
@@ -102,6 +104,9 @@ unsigned long lastCharAddedTime = 0;  // Thời điểm nhập ký tự cuối (
 const unsigned long PASSWORD_TIMEOUT = 10000; // 10 giây timeout
 const unsigned long CHAR_DISPLAY_MS = 300;    // Hiển thị ký tự thật 300ms trước khi đổi thành *
 bool waitingPasswordResult = false;
+bool waitingRfidResult = false;
+unsigned long rfidRequestAt = 0;
+const unsigned long RFID_RESULT_TIMEOUT_MS = 7000;
 
 // ================= BIẾN TRẠNG THÁI =================
 bool isDoorOpen = false;
@@ -229,8 +234,10 @@ void reconnectMQTT() {
       Serial.println("connected!");
       client.subscribe(mqtt_topic_control);
       client.subscribe(mqtt_topic_password_result);
+      client.subscribe(mqtt_topic_rfid_result);
       Serial.println("Subscribed to: esp32/control");
       Serial.println("Subscribed to: esp32/password/result");
+      Serial.println("Subscribed to: esp32/rfid/result");
       
       lcd.clear();
       lcd.setCursor(0, 0);
@@ -324,11 +331,83 @@ void sendPasswordHashToServer(const String& rawPassword) {
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print("CHECKING...");
-
-  Serial.print("Published password hash: ");
-  Serial.println(hashHex);
 }
 // ===== KẾT THÚC CHỨC NĂNG HASH MẬT KHẨU =====
+
+void sendRfidUidToServer(const String& uidHex) {
+  if (!client.connected()) {
+    return;
+  }
+
+  StaticJsonDocument<128> doc;
+  doc["uid"] = uidHex;
+  doc["source"] = "esp32";
+
+  char jsonBuffer[128];
+  serializeJson(doc, jsonBuffer);
+  client.publish(mqtt_topic_rfid, jsonBuffer);
+  waitingRfidResult = true;
+  rfidRequestAt = millis();
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("RFID CHECKING...");
+  lcd.setCursor(0, 1);
+  lcd.print("UID:");
+  lcd.print(uidHex);
+
+  Serial.print("Published RFID UID: ");
+  Serial.println(uidHex);
+}
+
+void handleRfidAuthResult(const String& message) {
+  waitingRfidResult = false;
+  rfidRequestAt = 0;
+
+  StaticJsonDocument<192> doc;
+  DeserializationError err = deserializeJson(doc, message);
+  String status = "";
+  String text = "";
+  if (!err) {
+    status = String((const char*)(doc["status"] | ""));
+    text = String((const char*)(doc["message"] | ""));
+  }
+
+  status.toUpperCase();
+
+  if (status == "OK" || status == "INIT_OK") {
+    shortBeep();
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("RFID VALID");
+    lcd.setCursor(0, 1);
+    lcd.print("OPEN BY SERVER");
+    delay(1200);
+    lcd.clear();
+    return;
+  }
+
+  if (status == "DENY") {
+    digitalWrite(BUZZER_PIN, HIGH);
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("RFID INVALID");
+    lcd.setCursor(0, 1);
+    lcd.print("ACCESS DENIED");
+    delay(1400);
+    digitalWrite(BUZZER_PIN, LOW);
+    lcd.clear();
+    return;
+  }
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("RFID ERROR");
+  lcd.setCursor(0, 1);
+  lcd.print(text.length() > 0 ? text.substring(0, 16) : "TRY AGAIN");
+  delay(1200);
+  lcd.clear();
+}
 
 void callback(char* topic, byte* payload, unsigned int length) {
   String topicStr = String(topic);
@@ -354,6 +433,11 @@ void callback(char* topic, byte* payload, unsigned int length) {
       passwordAuthSuccessPending = false;
       handlePasswordAuthResult(false);
     }
+    return;
+  }
+
+  if (topicStr == mqtt_topic_rfid_result) {
+    handleRfidAuthResult(message);
     return;
   }
   // ===== KẾT THÚC CHỨC NĂNG HASH MẬT KHẨU =====
@@ -470,6 +554,10 @@ void publishEvent(const char* eventName) {
   Serial.println(eventName);
 }
 
+bool readPirMotion() {
+  return digitalRead(PIR_PIN) == PIR_ACTIVE_LEVEL;
+}
+
 void publishSensorData() {
   if (!client.connected()) {
     return;
@@ -477,7 +565,7 @@ void publishSensorData() {
   
   // Đọc cảm biến
   bool isRaining = (digitalRead(RAIN_PIN) == LOW);
-  bool pirDetected = digitalRead(PIR_PIN);
+  bool pirDetected = readPirMotion();
   bool isFire = (digitalRead(FLAME_PIN) == LOW);
   int gasValue = gasAverageValue;
   
@@ -527,7 +615,7 @@ void setup() {
   pinMode(RAIN_PIN, INPUT);
   pinMode(FLAME_PIN, INPUT);
   pinMode(BUZZER_PIN, OUTPUT);
-  pinMode(PIR_PIN, INPUT);
+  pinMode(PIR_PIN, INPUT_PULLDOWN);
 
   SPI.begin();
   rfid.PCD_Init();
@@ -610,7 +698,7 @@ void loop() {
 
   // ===== ĐỌC CẢM BIẾN KHÁC =====
   bool isRaining   = (digitalRead(RAIN_PIN) == LOW);
-  bool pirDetected = digitalRead(PIR_PIN);
+  bool pirDetected = readPirMotion();
   bool isFire      = (digitalRead(FLAME_PIN) == LOW);
   int  gasRawValue = analogRead(GAS_PIN);
   int  gasValue    = updateGasAverage(gasRawValue);
@@ -709,16 +797,12 @@ void loop() {
     digitalWrite(BUZZER_PIN, LOW);
   }
 
-  // ===== PIR - HUMAN DETECTED =====
+  // ===== PIR HC-SR501 - PHÁT HIỆN CHUYỂN ĐỘNG =====
   if (pirDetected != lastPirState) {
-    sendToESP8266(pirDetected ? "HUMAN_DETECTED" : "HUMAN_LEFT");
-    publishEvent(pirDetected ? "HUMAN_DETECTED" : "HUMAN_LEFT");
+    publishEvent(pirDetected ? "MOTION_DETECTED" : "MOTION_STOPPED");
 
-    // ===== TỰ ĐỘNG BẬT ĐÈN KHI PHÁT HIỆN NGƯỜI =====
-    if (millis() > light4ManualOverrideUntil) {
-      light4State = pirDetected;
-      sendToESP8266(pirDetected ? "LIGHT4_ON" : "LIGHT4_OFF");
-    }
+    // ĐÈN sẽ được điều khiển tập trung từ SERVER sau khi nhận PIR.
+    // Luồng mới: ESP32 gửi sensor/event -> Server quyết định -> Server publish LIGHT4_* -> ESP32 -> ESP8266.
 
     lastPirState = pirDetected;
   }
@@ -730,24 +814,22 @@ void loop() {
     lastLcdUpdate = millis();
   }
 
-  // ===== RFID - TỰ ĐỘNG MỞ/ĐÓNG CỬA =====
-  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
-    isDoorOpen = !isDoorOpen;
-    sendToESP8266(isDoorOpen ? "DOOR_OPEN" : "DOOR_CLOSE");
-    publishEvent(isDoorOpen ? "RFID_OPEN" : "RFID_CLOSE");
-    if (isDoorOpen) {
-      shortBeep();
+  // ===== RFID - QUÉT -> SERVER XÁC THỰC -> MỚI MỞ CỬA =====
+  if (!waitingRfidResult && rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+    String uidHex = "";
+    for (byte i = 0; i < rfid.uid.size; i++) {
+      if (rfid.uid.uidByte[i] < 0x10) {
+        uidHex += "0";
+      }
+      uidHex += String(rfid.uid.uidByte[i], HEX);
     }
-    
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("RFID DETECTED");
-    lcd.setCursor(0, 1);
-    lcd.print(isDoorOpen ? "DOOR: OPENED" : "DOOR: CLOSED");
-    delay(2000);
-    lcd.clear();
-    
+    uidHex.toUpperCase();
+
+    sendRfidUidToServer(uidHex);
+    publishEvent("RFID_SCAN");
+
     rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
   }
 
   // ===== TOUCH =====
@@ -792,6 +874,18 @@ void loop() {
     lcd.clear();
   }
 
+  if (waitingRfidResult && rfidRequestAt > 0 && (millis() - rfidRequestAt > RFID_RESULT_TIMEOUT_MS)) {
+    waitingRfidResult = false;
+    rfidRequestAt = 0;
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("RFID TIMEOUT");
+    lcd.setCursor(0, 1);
+    lcd.print("TRY AGAIN");
+    delay(1000);
+    lcd.clear();
+  }
+
   delay(20);
 }
 
@@ -802,13 +896,7 @@ void displayPasswordInput() {
   lcd.setCursor(0, 1);
   String disp = "";
   for (unsigned int i = 0; i < inputPassword.length(); i++) {
-    if (i == inputPassword.length() - 1 && 
-        (millis() - lastCharAddedTime < CHAR_DISPLAY_MS) &&
-        lastCharAddedTime > 0) {
-      disp += inputPassword[i];
-    } else {
-      disp += '*';
-    }
+    disp += '*';
   }
   lcd.print(disp);
   for (int i = disp.length(); i < 16; i++) lcd.print(" ");
@@ -889,7 +977,7 @@ void displayLCD() {
 
   // Đọc cảm biến
   bool isRaining = (digitalRead(RAIN_PIN) == LOW);
-  bool pirDetected = digitalRead(PIR_PIN);
+  bool pirDetected = readPirMotion();
   bool isFire = (digitalRead(FLAME_PIN) == LOW);
   int gasValue = gasAverageValue;
   bool gasDetected = (gasValue > GAS_ALERT_THRESHOLD);

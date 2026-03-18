@@ -28,8 +28,8 @@
 #define ULN_ACTIVE_HIGH 1
 
 /* ========== GÓC SERVO CHUẨN ========== */
-#define DOOR_CLOSE_ANGLE 80 
-#define DOOR_OPEN_ANGLE  150  
+#define DOOR_CLOSE_ANGLE 70 
+#define DOOR_OPEN_ANGLE  170  
 #define ROOF_CLOSE_ANGLE 120 
 #define ROOF_OPEN_ANGLE  0 
 

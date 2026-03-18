@@ -10,6 +10,7 @@ import threading
 import time
 from ai_engine import SmartHomeAI
 import re
+import hashlib
 try:
     import requests
 except Exception:
@@ -22,33 +23,6 @@ try:
     import pyttsx3
 except Exception:
     pyttsx3 = None
-
-# ================== MONGODB ==================
-mongo = MongoClient("mongodb://localhost:27017/")
-db = mongo["iot_db"]
-collection_sensor = db["sensor_data"]  # Dữ liệu cảm biến định kỳ
-collection_events = db["events"]  # Sự kiện quan trọng
-collection_states = db["device_states"]  # Trạng thái thiết bị
-collection_user_actions = db["user_actions"]  # Lịch sử điều khiển thiết bị
-collection_ai_alias = db["ai_alias"]  # Alias người dùng đặt cho thiết bị
-collection_device_names = db["device_names"]  # Tên hiển thị thiết bị do người dùng đặt
-collection_mobile_push_tokens = db["mobile_push_tokens"]  # Token FCM từ mobile
-
-# Tạo index cho truy vấn nhanh hơn
-collection_sensor.create_index("timestamp")
-collection_events.create_index("timestamp")
-collection_events.create_index("event_type")
-collection_user_actions.create_index("timestamp")
-collection_mobile_push_tokens.create_index("token", unique=True)
-
-print("MongoDB connected")
-
-# ================== AI ENGINE ==================
-ai_engine = SmartHomeAI(db)
-
-# ================== FLASK ==================
-app = Flask(__name__, template_folder='templates')
-CORS(app)  # Cho phép CORS để web app có thể gọi API
 
 # ================== ENV FILE ==================
 ENV_FILE = os.path.join(os.path.dirname(__file__), ".env")
@@ -74,6 +48,245 @@ def load_env_file(path):
 
 load_env_file(ENV_FILE)
 
+# ================== MONGODB ==================
+mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017/").strip()
+mongo_db_name = os.getenv("MONGO_DB_NAME", "iot_db").strip() or "iot_db"
+mongo = MongoClient(mongo_uri)
+db = mongo[mongo_db_name]
+collection_sensor = db["sensor_data"]  # Dữ liệu cảm biến định kỳ
+collection_events = db["events"]  # Sự kiện quan trọng
+collection_states = db["device_states"]  # Trạng thái thiết bị
+collection_user_actions = db["user_actions"]  # Lịch sử điều khiển thiết bị
+collection_ai_alias = db["ai_alias"]  # Alias người dùng đặt cho thiết bị
+collection_device_names = db["device_names"]  # Tên hiển thị thiết bị do người dùng đặt
+collection_mobile_push_tokens = db["mobile_push_tokens"]  # Token FCM từ mobile
+collection_users = db["users"]  # Tài khoản đăng nhập app
+collection_rfid_cards = db["rfid_cards"]  # Thẻ RFID hợp lệ để mở cửa
+collection_rfid_scans = db["rfid_scans"]  # Lịch sử quét RFID
+collection_door_password = db["door_password"]  # Mật khẩu mở cửa
+
+# Tạo index cho truy vấn nhanh hơn
+collection_sensor.create_index("timestamp")
+collection_events.create_index("timestamp")
+collection_events.create_index("event_type")
+collection_user_actions.create_index("timestamp")
+collection_mobile_push_tokens.create_index("token", unique=True)
+collection_users.create_index("username", unique=True)
+collection_rfid_cards.create_index("slot", unique=True)
+collection_rfid_scans.create_index("timestamp")
+collection_rfid_scans.create_index("uid")
+collection_door_password.create_index("slot", unique=True)
+
+print(f"MongoDB connected: {mongo_db_name}")
+
+
+def _sha256_hex(raw_text: str):
+    return hashlib.sha256((raw_text or "").encode("utf-8")).hexdigest()
+
+
+def _normalize_rfid_uid(value: str):
+    raw = (value or "").strip().upper()
+    if not raw:
+        return ""
+    return re.sub(r"[^0-9A-F]", "", raw)
+
+
+def _get_active_rfid_card():
+    return collection_rfid_cards.find_one({"slot": "main"})
+
+
+def _upsert_active_rfid_card(uid: str, source: str = "manual"):
+    collection_rfid_cards.update_one(
+        {"slot": "main"},
+        {
+            "$set": {
+                "uid": uid,
+                "source": source,
+                "updated_at": datetime.now()
+            },
+            "$setOnInsert": {
+                "created_at": datetime.now()
+            }
+        },
+        upsert=True
+    )
+
+
+def _record_rfid_scan(uid: str, status: str, source: str = "esp32", data=None):
+    collection_rfid_scans.insert_one({
+        "timestamp": datetime.now(),
+        "uid": uid,
+        "status": status,
+        "source": source,
+        "data": data or {}
+    })
+
+
+def _publish_rfid_result(status: str, message: str, uid: str, auto_open=False):
+    if not mqtt_client:
+        return
+    payload = {
+        "status": status,
+        "message": message,
+        "uid": uid,
+        "auto_open": bool(auto_open)
+    }
+    mqtt_client.publish(MQTT_TOPIC_RFID_RESULT, json.dumps(payload, ensure_ascii=False))
+
+
+def _get_door_password_hash():
+    doc = collection_door_password.find_one({"slot": "main"})
+    if not doc:
+        return None
+    value = doc.get("pwd_sha256") or doc.get("password_hash")
+    if value is None:
+        return None
+    return str(value).strip().lower()
+
+
+def _set_door_password_hash(hash_value: str, source: str = "manual"):
+    collection_door_password.update_one(
+        {"slot": "main"},
+        {
+            "$set": {
+                "pwd_sha256": hash_value,
+                "source": source,
+                "updated_at": datetime.now()
+            },
+            "$setOnInsert": {
+                "created_at": datetime.now()
+            }
+        },
+        upsert=True
+    )
+
+
+def _open_door_with_auto_close(reason: str, extra_data=None):
+    global rfid_auto_close_timer
+    if not mqtt_client:
+        return
+
+    mqtt_client.publish(MQTT_TOPIC_CONTROL, "DOOR_OPEN")
+
+    with rfid_auto_close_lock:
+        if rfid_auto_close_timer:
+            try:
+                rfid_auto_close_timer.cancel()
+            except Exception:
+                pass
+
+        def _close_later():
+            try:
+                if mqtt_client:
+                    mqtt_client.publish(MQTT_TOPIC_CONTROL, "DOOR_CLOSE")
+                    data = {
+                        "reason": reason,
+                        "delay_seconds": RFID_AUTO_CLOSE_SECONDS
+                    }
+                    if extra_data:
+                        data.update(extra_data)
+                    save_event(
+                        "DOOR_AUTO_CLOSE",
+                        f"Tự động đóng cửa sau {RFID_AUTO_CLOSE_SECONDS} giây",
+                        data
+                    )
+            except Exception as e:
+                print(f"[DOOR] Auto close error: {e}")
+
+        rfid_auto_close_timer = threading.Timer(RFID_AUTO_CLOSE_SECONDS, _close_later)
+        rfid_auto_close_timer.daemon = True
+        rfid_auto_close_timer.start()
+
+
+def _open_door_with_rfid_auto_close(uid: str, mode: str):
+    _open_door_with_auto_close("rfid", {"uid": uid, "mode": mode})
+
+
+def _handle_rfid_scan(payload: str):
+    incoming_uid = ""
+    source = "esp32"
+    try:
+        data = json.loads(payload)
+        incoming_uid = _normalize_rfid_uid(data.get("uid"))
+        source = (data.get("source") or "esp32").strip().lower() or "esp32"
+    except Exception:
+        incoming_uid = _normalize_rfid_uid(payload)
+        data = {"raw": payload}
+
+    if not incoming_uid:
+        _record_rfid_scan("", "empty", source, data)
+        save_event("RFID_EMPTY", "Quét RFID rỗng hoặc lỗi đọc UID", {"source": source})
+        _publish_rfid_result("EMPTY", "UID RFID rong", "", auto_open=False)
+        return
+
+    active = _get_active_rfid_card()
+    active_uid = _normalize_rfid_uid((active or {}).get("uid"))
+
+    if not active_uid:
+        _upsert_active_rfid_card(incoming_uid, source="first_scan")
+        _record_rfid_scan(incoming_uid, "initialized", source, data)
+        save_event("RFID_INIT", "Khởi tạo thẻ RFID đầu tiên", {"uid": incoming_uid, "source": source})
+        _publish_rfid_result("INIT_OK", "Da khoi tao the dau tien", incoming_uid, auto_open=True)
+        _open_door_with_rfid_auto_close(incoming_uid, "init")
+        return
+
+    if incoming_uid == active_uid:
+        _record_rfid_scan(incoming_uid, "granted", source, data)
+        save_event("RFID_GRANTED", "Xác thực RFID thành công", {"uid": incoming_uid, "source": source})
+        _publish_rfid_result("OK", "RFID hop le - mo cua", incoming_uid, auto_open=True)
+        _open_door_with_rfid_auto_close(incoming_uid, "granted")
+        return
+
+    _record_rfid_scan(incoming_uid, "denied", source, data)
+    save_event("RFID_DENIED", "Cảnh báo: RFID không hợp lệ", {
+        "uid": incoming_uid,
+        "expected_uid": active_uid,
+        "source": source
+    })
+    _publish_rfid_result("DENY", "RFID sai - tu choi", incoming_uid, auto_open=False)
+    send_mobile_push_alert(
+        "🚫 CẢNH BÁO RFID",
+        f"Phát hiện thẻ RFID không hợp lệ: {incoming_uid}",
+        {"event_type": "RFID_DENIED", "uid": incoming_uid}
+    )
+
+
+def ensure_default_admin_user():
+    username = "admin"
+    default_password_hash = _sha256_hex("123")
+
+    existing = collection_users.find_one({"username": username})
+    if existing:
+        return
+
+    collection_users.insert_one({
+        "username": username,
+        "pwd_sha256": default_password_hash,
+        "created_at": datetime.now(),
+        "updated_at": datetime.now(),
+        "is_default": True
+    })
+    print("[AUTH] Created default admin account")
+
+
+def ensure_default_door_password():
+    existing = _get_door_password_hash()
+    if existing:
+        return
+
+    print("[DOOR] Door password is not initialized yet")
+
+
+ensure_default_admin_user()
+ensure_default_door_password()
+
+# ================== AI ENGINE ==================
+ai_engine = SmartHomeAI(db)
+
+# ================== FLASK ==================
+app = Flask(__name__, template_folder='templates')
+CORS(app)  # Cho phép CORS để web app có thể gọi API
+
 # ================== MQTT ==================
 MQTT_BROKER = "3c5308fe02794486932d547731382984.s1.eu.hivemq.cloud"
 MQTT_PORT = 8883
@@ -82,9 +295,16 @@ MQTT_TOPIC_CONTROL = "esp32/control"
 MQTT_TOPIC_EVENTS = "esp32/events"
 MQTT_TOPIC_PASSWORD = "esp32/password"
 MQTT_TOPIC_PASSWORD_RESULT = "esp32/password/result"
+MQTT_TOPIC_RFID = "esp32/rfid"
+MQTT_TOPIC_RFID_RESULT = "esp32/rfid/result"
 
 latest_data = {}
 mqtt_client = None
+last_esp32_seen = None
+ESP32_OFFLINE_SECONDS = int(os.getenv("ESP32_OFFLINE_SECONDS", "10"))
+RFID_AUTO_CLOSE_SECONDS = int(os.getenv("RFID_AUTO_CLOSE_SECONDS", "10"))
+rfid_auto_close_timer = None
+rfid_auto_close_lock = threading.Lock()
 
 # ================== VOICE CONTROL ==================
 VOICE_ENABLED = os.getenv("VOICE_ENABLED", "1") == "1"
@@ -144,6 +364,10 @@ def _normalize_hash(value):
 
 
 def _find_stored_password_hash():
+    door_hash = _get_door_password_hash()
+    if door_hash:
+        return door_hash
+
     # Tìm password_hash ở các collection thường dùng trước.
     for coll_name in PASSWORD_HASH_COLLECTION_CANDIDATES:
         doc = db[coll_name].find_one({"password_hash": {"$exists": True}})
@@ -178,7 +402,7 @@ def _handle_password_hash_check(payload):
 
     mqtt_client.publish(MQTT_TOPIC_PASSWORD_RESULT, "OK" if is_valid else "FAIL")
     if is_valid:
-        mqtt_client.publish(MQTT_TOPIC_CONTROL, "DOOR_OPEN")
+        _open_door_with_auto_close("keypad", {"source": "esp32/password"})
     save_event(
         "PASSWORD_OK" if is_valid else "PASSWORD_FAIL",
         "Xác thực mật khẩu keypad thành công" if is_valid else "Xác thực mật khẩu keypad thất bại",
@@ -191,6 +415,7 @@ def on_connect(client, userdata, flags, rc):
     client.subscribe(MQTT_TOPIC_SENSOR)
     client.subscribe(MQTT_TOPIC_EVENTS)
     client.subscribe(MQTT_TOPIC_PASSWORD)
+    client.subscribe(MQTT_TOPIC_RFID)
 
 def save_event(event_type, description, data=None):
     """Lưu sự kiện quan trọng vào MongoDB"""
@@ -322,6 +547,16 @@ def check_and_save_changes(data):
     if data.get("pir") != previous_state["pir"]:
         event_type = "MOTION_DETECTED" if data.get("pir") else "MOTION_STOPPED"
         save_event(event_type, f"{'Phát hiện chuyển động' if data.get('pir') else 'Không còn chuyển động'}", {"pir": data.get("pir")})
+
+        # PIR automation: server quyết định và gửi lệnh ngược về ESP32 để ESP8266 bật/tắt đèn.
+        if mqtt_client:
+            auto_command = "LIGHT4_ON" if data.get("pir") else "LIGHT4_OFF"
+            mqtt_client.publish(MQTT_TOPIC_CONTROL, auto_command)
+            save_event(
+                "AUTO_LIGHT4_ON_BY_PIR" if data.get("pir") else "AUTO_LIGHT4_OFF_BY_PIR",
+                "Server tự động bật đèn 4 khi phát hiện chuyển động PIR" if data.get("pir") else "Server tự động tắt đèn 4 khi không còn chuyển động PIR",
+                {"command": auto_command, "source": "pir_automation"}
+            )
         has_important_change = True
     
     # Kiểm tra gas vượt ngưỡng
@@ -369,13 +604,18 @@ def check_and_save_changes(data):
     return has_important_change
 
 def on_message(client, userdata, msg):
-    global latest_data, last_periodic_save
+    global latest_data, last_periodic_save, last_esp32_seen
     topic = getattr(msg, "topic", "") or ""
     try:
         payload = msg.payload.decode()
+        if topic in {MQTT_TOPIC_SENSOR, MQTT_TOPIC_EVENTS, MQTT_TOPIC_PASSWORD, MQTT_TOPIC_RFID}:
+            last_esp32_seen = datetime.now()
         # ===== BẮT ĐẦU CHỨC NĂNG HASH MẬT KHẨU =====
         if topic == MQTT_TOPIC_PASSWORD:
             _handle_password_hash_check(payload)
+            return
+        if topic == MQTT_TOPIC_RFID:
+            _handle_rfid_scan(payload)
             return
         # ===== KẾT THÚC CHỨC NĂNG HASH MẬT KHẨU =====
 
@@ -385,13 +625,17 @@ def on_message(client, userdata, msg):
                 ev = json.loads(payload) if payload.strip().startswith("{") else {"event": payload.strip()}
                 event_type = ev.get("event", str(ev))
                 desc_map = {
+                    "RFID_SCAN": "Quét RFID",
                     "RFID_OPEN": "RFID mở cửa",
                     "RFID_CLOSE": "RFID đóng cửa",
+                    "RFID_GRANTED": "RFID hợp lệ",
+                    "RFID_DENIED": "RFID không hợp lệ",
+                    "RFID_INIT": "Khởi tạo RFID lần đầu",
                     "KEYPAD_OPEN": "Keypad mở cửa (mật khẩu đúng)",
                     "KEYPAD_CLOSE": "Keypad đóng cửa",
                     "BUZZER_ALARM": "Buzzer báo động kích hoạt",
-                    "HUMAN_DETECTED": "Phát hiện người (PIR)",
-                    "HUMAN_LEFT": "Không còn phát hiện người",
+                    "MOTION_DETECTED": "Phát hiện chuyển động (PIR HC-SR501)",
+                    "MOTION_STOPPED": "Không còn phát hiện chuyển động",
                     "ROOF_AUTO_CLOSE_RAIN": "Mái tự động đóng do mưa",
                     "ROOF_AUTO_OPEN": "Mái tự động mở khi hết mưa"
                 }
@@ -769,6 +1013,21 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/history")
+def history_page():
+    return render_template("history.html")
+
+
+@app.route("/rfid")
+def rfid_page():
+    return render_template("rfid.html")
+
+
+@app.route("/door-password/manage")
+def door_password_page():
+    return render_template("door_password.html")
+
+
 def _get_device_name_map():
     """Lấy map tên thiết bị từ MongoDB: {device_key: display_name}."""
     docs = list(
@@ -788,6 +1047,7 @@ def _get_device_name_map():
 @app.route("/sensor/latest")
 def get_latest():
     device_names = _get_device_name_map()
+    esp32 = get_esp32_status()
     if latest_data:
         data = latest_data.copy()
         if "_id" in data:
@@ -795,15 +1055,30 @@ def get_latest():
         if "timestamp" in data:
             data["timestamp"] = str(data["timestamp"])
         data["device_names"] = device_names
+        data["esp32_connected"] = esp32["connected"]
+        data["esp32_last_seen"] = esp32["last_seen"]
+        data["esp32_age_seconds"] = esp32["age_seconds"]
+        data["esp32_offline_timeout_seconds"] = esp32["offline_timeout_seconds"]
+        data["esp32_status_message"] = esp32["message"]
         return jsonify(data)
-    return jsonify({"message": "No data", "device_names": device_names})
+    return jsonify({
+        "message": "No data",
+        "device_names": device_names,
+        "esp32_connected": esp32["connected"],
+        "esp32_last_seen": esp32["last_seen"],
+        "esp32_age_seconds": esp32["age_seconds"],
+        "esp32_offline_timeout_seconds": esp32["offline_timeout_seconds"],
+        "esp32_status_message": esp32["message"]
+    })
 
 
 @app.route("/mobile/bootstrap")
 def mobile_bootstrap():
     """Trả dữ liệu khởi tạo cho mobile: sensor mới nhất + tên thiết bị."""
+    esp32 = get_esp32_status()
     payload = {
-        "device_names": _get_device_name_map()
+        "device_names": _get_device_name_map(),
+        "esp32": esp32
     }
     if latest_data:
         sensor = latest_data.copy()
@@ -843,14 +1118,211 @@ def register_mobile_token():
 
     return jsonify({"success": True})
 
+
+# ================== RFID ROUTES ==================
+
+@app.route("/rfid/card", methods=["GET"])
+def get_rfid_card():
+    card = _get_active_rfid_card() or {}
+    uid = _normalize_rfid_uid(card.get("uid"))
+    return jsonify({
+        "success": True,
+        "is_initialized": bool(uid),
+        "uid": uid,
+        "source": card.get("source"),
+        "updated_at": str(card.get("updated_at")) if card.get("updated_at") else None
+    })
+
+
+@app.route("/rfid/card", methods=["POST"])
+def upsert_rfid_card():
+    data = request.json or {}
+    new_uid = _normalize_rfid_uid(data.get("new_uid"))
+    old_uid = _normalize_rfid_uid(data.get("old_uid"))
+
+    if not new_uid:
+        return jsonify({"success": False, "error": "new_uid là bắt buộc"}), 400
+
+    active = _get_active_rfid_card() or {}
+    active_uid = _normalize_rfid_uid(active.get("uid"))
+
+    if active_uid and old_uid != active_uid:
+        return jsonify({"success": False, "error": "Mã thẻ cũ không đúng"}), 401
+
+    mode = "initialize" if not active_uid else "change"
+    _upsert_active_rfid_card(new_uid, source="manual")
+
+    save_event(
+        "RFID_CARD_INITIALIZED" if mode == "initialize" else "RFID_CARD_CHANGED",
+        "Khởi tạo mã thẻ RFID từ giao diện" if mode == "initialize" else "Đổi mã thẻ RFID từ giao diện",
+        {
+            "mode": mode,
+            "new_uid": new_uid
+        }
+    )
+
+    return jsonify({
+        "success": True,
+        "mode": mode,
+        "uid": new_uid
+    })
+
+
+@app.route("/rfid/scans", methods=["GET"])
+def get_rfid_scans():
+    limit = request.args.get("limit", 30, type=int)
+    limit = max(1, min(limit, 200))
+
+    docs = list(collection_rfid_scans.find({}).sort("timestamp", -1).limit(limit))
+    items = []
+    for d in docs:
+        items.append({
+            "timestamp": str(d.get("timestamp")) if d.get("timestamp") else None,
+            "uid": d.get("uid", ""),
+            "status": d.get("status", ""),
+            "source": d.get("source", ""),
+            "data": d.get("data", {})
+        })
+
+    return jsonify({
+        "success": True,
+        "count": len(items),
+        "items": items
+    })
+
+
+@app.route("/door-password", methods=["GET"])
+def get_door_password_info():
+    hash_value = _get_door_password_hash()
+    doc = collection_door_password.find_one({"slot": "main"}) or {}
+    return jsonify({
+        "success": True,
+        "is_initialized": bool(hash_value),
+        "source": doc.get("source"),
+        "updated_at": str(doc.get("updated_at")) if doc.get("updated_at") else None
+    })
+
+
+@app.route("/door-password", methods=["POST"])
+def update_door_password():
+    data = request.json or {}
+    old_hash = _normalize_hash(data.get("old_password_hash"))
+    new_hash = _normalize_hash(data.get("new_password_hash"))
+
+    if not new_hash:
+        return jsonify({"success": False, "error": "new_password_hash là bắt buộc"}), 400
+
+    current_hash = _get_door_password_hash()
+    if current_hash and old_hash != current_hash:
+        return jsonify({"success": False, "error": "Mật khẩu cũ không đúng"}), 401
+
+    mode = "initialize" if not current_hash else "change"
+    _set_door_password_hash(new_hash, source="manual")
+
+    save_event(
+        "DOOR_PASSWORD_INITIALIZED" if mode == "initialize" else "DOOR_PASSWORD_CHANGED",
+        "Khởi tạo mật khẩu cửa" if mode == "initialize" else "Đổi mật khẩu cửa",
+        {"mode": mode}
+    )
+
+    return jsonify({"success": True, "mode": mode})
+
+
+@app.route("/door/open-by-password", methods=["POST"])
+def open_door_by_password():
+    offline_response = require_esp32_connection()
+    if offline_response:
+        return offline_response
+
+    data = request.json or {}
+    incoming_hash = _normalize_hash(data.get("password_hash"))
+    if not incoming_hash:
+        return jsonify({"success": False, "error": "password_hash là bắt buộc"}), 400
+
+    stored_hash = _find_stored_password_hash()
+    if not stored_hash or incoming_hash != stored_hash:
+        save_event("PASSWORD_FAIL", "Mở cửa bằng mật khẩu thất bại", {"source": "mobile/web"})
+        return jsonify({"success": False, "error": "Mật khẩu không đúng"}), 401
+
+    _open_door_with_auto_close("password_ui", {"source": "mobile/web"})
+    save_event("PASSWORD_OK", "Mở cửa bằng mật khẩu thành công", {"source": "mobile/web"})
+    return jsonify({
+        "success": True,
+        "message": f"Mở cửa thành công, sẽ tự đóng sau {RFID_AUTO_CLOSE_SECONDS} giây"
+    })
+
 @app.route("/sensor/history")
 def get_history():
-    """Lấy lịch sử dữ liệu cảm biến"""
-    data = list(collection_sensor.find().sort("timestamp", -1).limit(50))
+    """Lấy lịch sử dữ liệu cảm biến, có thể lọc theo giờ/ngày/tháng/năm."""
+    period = (request.args.get("period") or "").strip().lower()
+    value = (request.args.get("value") or "").strip()
+    limit = request.args.get("limit", 200, type=int)
+    limit = max(1, min(limit, 5000))
+
+    def build_time_range(selected_period: str, selected_value: str):
+        try:
+            if selected_period == "hour":
+                start_time = datetime.strptime(selected_value, "%Y-%m-%dT%H")
+                end_time = start_time + timedelta(hours=1)
+            elif selected_period == "day":
+                start_time = datetime.strptime(selected_value, "%Y-%m-%d")
+                end_time = start_time + timedelta(days=1)
+            elif selected_period == "month":
+                start_time = datetime.strptime(selected_value, "%Y-%m")
+                if start_time.month == 12:
+                    end_time = datetime(start_time.year + 1, 1, 1)
+                else:
+                    end_time = datetime(start_time.year, start_time.month + 1, 1)
+            elif selected_period == "year":
+                start_time = datetime.strptime(selected_value, "%Y")
+                end_time = datetime(start_time.year + 1, 1, 1)
+            else:
+                return None, None
+            return start_time, end_time
+        except ValueError:
+            return None, None
+
+    query = {}
+    if period or value:
+        if not period or not value:
+            return jsonify({
+                "success": False,
+                "error": "Cần truyền đủ period và value để lọc dữ liệu"
+            }), 400
+
+        if period not in {"hour", "day", "month", "year"}:
+            return jsonify({
+                "success": False,
+                "error": "period chỉ nhận: hour, day, month, year"
+            }), 400
+
+        start_time, end_time = build_time_range(period, value)
+        if not start_time or not end_time:
+            return jsonify({
+                "success": False,
+                "error": "Giá trị value không đúng định dạng cho period đã chọn"
+            }), 400
+
+        query["timestamp"] = {
+            "$gte": start_time,
+            "$lt": end_time
+        }
+
+    data = list(
+        collection_sensor.find(query).sort("timestamp", -1).limit(limit)
+    )
+
     for d in data:
         d["_id"] = str(d["_id"])
         d["timestamp"] = str(d["timestamp"])
-    return jsonify(data)
+
+    return jsonify({
+        "success": True,
+        "period": period or None,
+        "value": value or None,
+        "count": len(data),
+        "data": data
+    })
 
 @app.route("/events")
 def get_events():
@@ -898,6 +1370,126 @@ def get_latest_state():
 
 def _normalize_device_key(device: str):
     return (device or "").strip().lower()
+
+
+def get_esp32_status():
+    if not last_esp32_seen:
+        return {
+            "connected": False,
+            "last_seen": None,
+            "offline_timeout_seconds": ESP32_OFFLINE_SECONDS,
+            "age_seconds": None,
+            "message": "Chưa nhận dữ liệu từ ESP32"
+        }
+
+    age_seconds = (datetime.now() - last_esp32_seen).total_seconds()
+    connected = age_seconds <= ESP32_OFFLINE_SECONDS
+
+    return {
+        "connected": connected,
+        "last_seen": str(last_esp32_seen),
+        "offline_timeout_seconds": ESP32_OFFLINE_SECONDS,
+        "age_seconds": round(age_seconds, 1),
+        "message": "ESP32 đã kết nối" if connected else "ESP32 không phản hồi"
+    }
+
+
+def require_esp32_connection():
+    status = get_esp32_status()
+    if status["connected"]:
+        return None
+    return jsonify({
+        "success": False,
+        "error": "ESP32 không kết nối, không thể điều khiển",
+        "esp32": status
+    }), 503
+
+
+def _normalize_username(username: str):
+    return (username or "").strip().lower()
+
+
+def _is_valid_sha256_hex(value: str):
+    if not value:
+        return False
+    text = value.strip().lower()
+    return bool(re.fullmatch(r"[0-9a-f]{64}", text))
+
+
+def _resolve_password_hash(payload: dict, password_field: str, hash_field: str):
+    incoming_hash = (payload.get(hash_field) or "").strip().lower()
+    if _is_valid_sha256_hex(incoming_hash):
+        return incoming_hash
+
+    raw_password = (payload.get(password_field) or "")
+    if raw_password:
+        return _sha256_hex(raw_password)
+
+    return None
+
+
+# ================== AUTH ROUTES ==================
+
+@app.route("/auth/register", methods=["POST"])
+def auth_register():
+    data = request.json or {}
+    username = _normalize_username(data.get("username"))
+    password_hash = _resolve_password_hash(data, "password", "password_hash")
+
+    if not username:
+        return jsonify({"success": False, "error": "username là bắt buộc"}), 400
+    if not password_hash:
+        return jsonify({"success": False, "error": "password hoặc password_hash là bắt buộc"}), 400
+
+    if collection_users.find_one({"username": username}):
+        return jsonify({"success": False, "error": "Tài khoản đã tồn tại"}), 409
+
+    collection_users.insert_one({
+        "username": username,
+        "pwd_sha256": password_hash,
+        "created_at": datetime.now(),
+        "updated_at": datetime.now()
+    })
+
+    return jsonify({"success": True, "username": username})
+
+
+@app.route("/auth/login", methods=["POST"])
+def auth_login():
+    data = request.json or {}
+    username = _normalize_username(data.get("username"))
+    password_hash = _resolve_password_hash(data, "password", "password_hash")
+
+    if not username or not password_hash:
+        return jsonify({"success": False, "error": "username và password/password_hash là bắt buộc"}), 400
+
+    user = collection_users.find_one({"username": username})
+    if not user or user.get("pwd_sha256") != password_hash:
+        return jsonify({"success": False, "error": "Sai tài khoản hoặc mật khẩu"}), 401
+
+    return jsonify({"success": True, "username": username})
+
+
+@app.route("/auth/change-password", methods=["POST"])
+def auth_change_password():
+    data = request.json or {}
+    username = _normalize_username(data.get("username"))
+    old_password_hash = _resolve_password_hash(data, "old_password", "old_password_hash")
+    new_password_hash = _resolve_password_hash(data, "new_password", "new_password_hash")
+
+    if not username or not old_password_hash or not new_password_hash:
+        return jsonify({"success": False, "error": "Thiếu username hoặc mật khẩu cũ/mới"}), 400
+
+    user = collection_users.find_one({"username": username})
+    if not user or user.get("pwd_sha256") != old_password_hash:
+        return jsonify({"success": False, "error": "Mật khẩu cũ không đúng"}), 401
+
+    collection_users.update_one(
+        {"username": username},
+        {"$set": {"pwd_sha256": new_password_hash, "updated_at": datetime.now()}}
+    )
+
+    return jsonify({"success": True, "username": username})
 
 
 # ================== DEVICE NAME ROUTES ==================
@@ -987,6 +1579,10 @@ def ai_teach_rule():
 @app.route("/ai/process", methods=["POST"])
 def ai_process():
     """Xử lý text từ client, publish MQTT và trả câu phản hồi để client đọc."""
+    offline_response = require_esp32_connection()
+    if offline_response:
+        return offline_response
+
     data = request.json or {}
     text = data.get("text", "").strip()
     if not text:
@@ -1015,6 +1611,30 @@ def ai_process():
 
     return jsonify({"error": "MQTT not connected"}), 500
 
+
+@app.route("/ai/wake", methods=["POST"])
+def ai_wake():
+    """Server xử lý wake-word và trả câu phản hồi để mobile đọc."""
+    data = request.json or {}
+    text = (data.get("text") or "nhà ơi").strip()
+
+    sensor_snapshot = latest_data.copy() if latest_data else {}
+    context = ai_engine.detect_context(sensor_snapshot)
+
+    if context.get("fire"):
+        response_text = "Nhà đây. Cảnh báo, đang phát hiện lửa. Bạn cần tôi làm gì?"
+    elif context.get("gas_alert"):
+        response_text = "Nhà đây. Cảnh báo khí gas đang cao, bạn cần tôi làm gì?"
+    else:
+        response_text = "Nhà đây bạn cần gì"
+
+    return jsonify({
+        "success": True,
+        "text": text,
+        "response_text": response_text,
+        "context": context
+    })
+
 @app.route("/ai/learn", methods=["POST"])
 def ai_learn():
     """Học từ user_actions + sensor_data và patterns giờ"""
@@ -1033,8 +1653,10 @@ def ai_learn():
 def ai_retrain():
     """Retrain model nếu cần (new intents >= 5 hoặc > 24h)"""
     try:
-        ok = ai_engine.retrain_model_if_needed()
-        return jsonify({"success": True, "retrained": ok})
+        payload = request.get_json(silent=True) or {}
+        force = bool(payload.get("force", False))
+        ok = ai_engine.retrain_model_if_needed(force=force)
+        return jsonify({"success": True, "retrained": ok, "force": force})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -1047,22 +1669,84 @@ def ai_context():
 
 @app.route("/voice/once", methods=["POST"])
 def voice_once():
-    """Deprecated: voice capture moved to mobile client."""
-    return jsonify({
-        "success": False,
-        "message": "Server không còn thu âm. Hãy gửi text lên /ai/process từ app mobile."
-    }), 410
+    """Thu âm một lần trên server (cho web) và xử lý bằng AI."""
+    offline_response = require_esp32_connection()
+    if offline_response:
+        return offline_response
+
+    if not VOICE_ENABLED:
+        return jsonify({"success": False, "message": "Voice đang tắt trên server"}), 503
+
+    voice_priority_event.set()
+    try:
+        text, err = voice_listen_once()
+        if err:
+            return jsonify({"success": False, "message": err})
+        if not text:
+            return jsonify({"success": False, "message": "Không nghe rõ"})
+
+        command = ai_engine.process_command(text)
+        if not command:
+            return jsonify({
+                "success": False,
+                "text": text,
+                "message": "Không nhận diện được lệnh",
+                "response_text": "Tôi không hiểu lệnh"
+            })
+
+        if not mqtt_client:
+            return jsonify({
+                "success": False,
+                "text": text,
+                "message": "MQTT chưa kết nối"
+            }), 500
+
+        result = mqtt_client.publish(MQTT_TOPIC_CONTROL, command)
+        if getattr(result, "rc", None) != mqtt.MQTT_ERR_SUCCESS:
+            return jsonify({
+                "success": False,
+                "text": text,
+                "message": "Gửi lệnh MQTT thất bại"
+            }), 500
+
+        log_user_action(command, "voice_once", raw_text=text)
+        response_text = describe_command(command)
+        return jsonify({
+            "success": True,
+            "text": text,
+            "command": command,
+            "response_text": response_text
+        })
+    finally:
+        voice_priority_event.clear()
 
 
 @app.route("/voice/status")
 def voice_status():
+    global wake_word_detected, wake_word_text
+    global wake_response_ready, wake_response_text
+    global wake_session_active
+
+    detected = bool(wake_word_detected)
+    detected_text = wake_word_text if wake_word_detected else ""
+    response_ready = bool(wake_response_ready)
+    response_text = wake_response_text if wake_response_ready else ""
+
+    # Trả event 1 lần cho UI web, tránh lặp hiển thị.
+    if wake_word_detected:
+        wake_word_detected = False
+        wake_word_text = ""
+    if wake_response_ready:
+        wake_response_ready = False
+        wake_response_text = ""
+
     return jsonify({
-        "wake_word": False,
-        "text": "",
-        "active": False,
-        "response_ready": False,
-        "response_text": "",
-        "message": "Server wake-word listener đã tắt."
+        "wake_word": detected,
+        "text": detected_text,
+        "active": bool(wake_session_active),
+        "response_ready": response_ready,
+        "response_text": response_text,
+        "message": "Wake-word listener đang hoạt động" if VOICE_ENABLED else "Voice đang tắt trên server"
     })
 
 # ================== CONTROL ROUTES ==================
@@ -1070,6 +1754,10 @@ def voice_status():
 @app.route("/control/door", methods=["POST"])
 def control_door():
     try:
+        offline_response = require_esp32_connection()
+        if offline_response:
+            return offline_response
+
         data = request.json
         action = data.get("action", "").upper()
         
@@ -1094,6 +1782,10 @@ def control_door():
 @app.route("/control/light", methods=["POST"])
 def control_light():
     try:
+        offline_response = require_esp32_connection()
+        if offline_response:
+            return offline_response
+
         data = request.json
         light_num = data.get("light", 1)
         state = data.get("state", False)
@@ -1114,6 +1806,10 @@ def control_light():
 @app.route("/control/fan", methods=["POST"])
 def control_fan():
     try:
+        offline_response = require_esp32_connection()
+        if offline_response:
+            return offline_response
+
         data = request.json
         state = data.get("state", False)
         
@@ -1133,6 +1829,10 @@ def control_fan():
 @app.route("/control/roof", methods=["POST"])
 def control_roof():
     try:
+        offline_response = require_esp32_connection()
+        if offline_response:
+            return offline_response
+
         data = request.json
         state = data.get("state", False)
         command = "ROOF_OPEN" if state else "ROOF_CLOSE"
@@ -1152,7 +1852,11 @@ def control_roof():
 if __name__ == "__main__":
     print("Initializing MQTT...")
     init_mqtt()
-    print("Voice capture mode: client-side (mobile)")
+    if VOICE_ENABLED:
+        print("Voice capture mode: server-side + web wake-word")
+        start_wake_word_listener()
+    else:
+        print("Voice capture disabled (VOICE_ENABLED=0)")
     start_ai_periodic_learn()
     print("Server started on http://0.0.0.0:5000")
     app.run(host="0.0.0.0", port=5000, debug=False)

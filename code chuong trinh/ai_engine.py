@@ -58,14 +58,24 @@ class SmartHomeAI:
 
     def teach_rule(self, condition: str, action: str):
         """Lưu luật tự động (condition -> action)"""
-        doc = {
-            "condition": condition.strip(),
-            "action": action.strip().upper(),
-            "created_at": datetime.now()
-        }
-        self.col_rules.insert_one(doc)
-        print(f"[AI RULE CREATED] {condition} -> {action}")
-        return {"inserted": True}
+        condition_norm = condition.strip()
+        action_norm = action.strip().upper()
+        result = self.col_rules.update_one(
+            {"condition": condition_norm, "action": action_norm},
+            {
+                "$set": {"updated_at": datetime.now()},
+                "$setOnInsert": {
+                    "condition": condition_norm,
+                    "action": action_norm,
+                    "created_at": datetime.now(),
+                    "source": "manual"
+                }
+            },
+            upsert=True
+        )
+        if result.upserted_id:
+            print(f"[AI RULE CREATED] {condition_norm} -> {action_norm}")
+        return {"matched": result.matched_count, "upserted": bool(result.upserted_id)}
 
     # ================== CORE ==================
     def process_command(self, text: str):
@@ -294,7 +304,7 @@ class SmartHomeAI:
             return default
 
     # ================== RETRAIN ==================
-    def retrain_model_if_needed(self) -> bool:
+    def retrain_model_if_needed(self, force: bool = False) -> bool:
         """
         Retrain nếu:
         - new_intents >= 5 HOẶC
@@ -305,7 +315,7 @@ class SmartHomeAI:
         last_trained = meta.get("last_trained_at")
         now = datetime.now()
 
-        should_train = new_count >= 5
+        should_train = force or new_count >= 5
         if last_trained:
             if (now - last_trained).total_seconds() > 86400:
                 should_train = True
