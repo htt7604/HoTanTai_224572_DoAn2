@@ -10,6 +10,8 @@ import android.widget.Toast;
 
 import androidx.appcompat.app.AppCompatActivity;
 
+import com.google.firebase.messaging.FirebaseMessaging;
+
 import org.json.JSONObject;
 
 import java.io.IOException;
@@ -162,6 +164,15 @@ public class LoginActivity extends AppCompatActivity {
                                 .putBoolean(KEY_AUTH_REMEMBER, remember)
                                 .putString(KEY_AUTH_PASSWORD_HASH, remember ? passwordHash : "")
                                 .apply();
+
+                        FirebaseMessaging.getInstance().getToken()
+                                .addOnCompleteListener(task -> {
+                                    if (!task.isSuccessful()) {
+                                        return;
+                                    }
+                                    String token = task.getResult();
+                                    PushTokenRegistrar.register(getApplicationContext(), token, username, true);
+                                });
 
                         etPassword.setText("");
                         tvStatus.setText("Đăng nhập thành công");

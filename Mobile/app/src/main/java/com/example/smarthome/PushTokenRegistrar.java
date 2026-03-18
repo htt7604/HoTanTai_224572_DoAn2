@@ -19,7 +19,10 @@ public final class PushTokenRegistrar {
 
     private static final String PREFS_NAME = "smarthome_prefs";
     private static final String KEY_BASE_URL = "base_url";
+    private static final String KEY_AUTH_USERNAME = "auth_username";
     private static final String KEY_LAST_REGISTERED_TOKEN = "last_registered_fcm_token";
+    private static final String KEY_LAST_REGISTERED_USERNAME = "last_registered_fcm_username";
+    private static final String KEY_LAST_REGISTERED_BASE_URL = "last_registered_fcm_base_url";
     private static final String DEFAULT_BASE_URL = "http://103.166.182.44:5000";
     private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
     private static final OkHttpClient HTTP = new OkHttpClient();
@@ -27,23 +30,37 @@ public final class PushTokenRegistrar {
     private PushTokenRegistrar() {}
 
     public static void register(Context context, String token) {
+        register(context, token, null, false);
+    }
+
+    public static void register(Context context, String token, String username, boolean force) {
         if (context == null || token == null || token.trim().isEmpty()) {
             return;
         }
 
         String trimmedToken = token.trim();
         SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-        String lastToken = prefs.getString(KEY_LAST_REGISTERED_TOKEN, "");
-        if (trimmedToken.equals(lastToken)) {
-            return;
-        }
+        String resolvedUsername = (username == null || username.trim().isEmpty())
+                ? prefs.getString(KEY_AUTH_USERNAME, "")
+                : username.trim().toLowerCase();
 
         String baseUrl = prefs.getString(KEY_BASE_URL, DEFAULT_BASE_URL);
         if (baseUrl == null) {
             baseUrl = DEFAULT_BASE_URL;
         }
         baseUrl = sanitizeBaseUrl(baseUrl);
-        if (baseUrl.contains("127.0.0.1") || baseUrl.contains("localhost")) {
+        final String resolvedBaseUrl = baseUrl;
+        if (resolvedBaseUrl.contains("127.0.0.1") || resolvedBaseUrl.contains("localhost")) {
+            return;
+        }
+
+        String lastToken = prefs.getString(KEY_LAST_REGISTERED_TOKEN, "");
+        String lastUsername = prefs.getString(KEY_LAST_REGISTERED_USERNAME, "");
+        String lastBaseUrl = prefs.getString(KEY_LAST_REGISTERED_BASE_URL, "");
+        if (!force
+                && trimmedToken.equals(lastToken)
+                && resolvedUsername.equals(lastUsername)
+                && resolvedBaseUrl.equals(lastBaseUrl)) {
             return;
         }
 
@@ -51,9 +68,12 @@ public final class PushTokenRegistrar {
             JSONObject body = new JSONObject();
             body.put("token", trimmedToken);
             body.put("platform", "android");
+            if (!resolvedUsername.isEmpty()) {
+                body.put("username", resolvedUsername);
+            }
 
             Request request = new Request.Builder()
-                    .url(baseUrl + "/mobile/register-token")
+                    .url(resolvedBaseUrl + "/mobile/register-token")
                     .post(RequestBody.create(body.toString(), JSON))
                     .build();
 
@@ -65,7 +85,11 @@ public final class PushTokenRegistrar {
                 @Override
                 public void onResponse(Call call, Response response) {
                     if (response.isSuccessful()) {
-                        prefs.edit().putString(KEY_LAST_REGISTERED_TOKEN, trimmedToken).apply();
+                        prefs.edit()
+                                .putString(KEY_LAST_REGISTERED_TOKEN, trimmedToken)
+                                .putString(KEY_LAST_REGISTERED_USERNAME, resolvedUsername)
+                                .putString(KEY_LAST_REGISTERED_BASE_URL, resolvedBaseUrl)
+                                .apply();
                     }
                     response.close();
                 }

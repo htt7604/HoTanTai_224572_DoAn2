@@ -1132,6 +1132,7 @@ def register_mobile_token():
     data = request.json or {}
     token = (data.get("token") or "").strip()
     platform = (data.get("platform") or "android").strip().lower()
+    username = _normalize_username(data.get("username"))
 
     if not token:
         return jsonify({"success": False, "error": "token là bắt buộc"}), 400
@@ -1141,6 +1142,7 @@ def register_mobile_token():
         {
             "$set": {
                 "platform": platform,
+                "username": username,
                 "updated_at": datetime.now()
             },
             "$setOnInsert": {
@@ -1149,6 +1151,9 @@ def register_mobile_token():
         },
         upsert=True
     )
+
+    uname_log = username or "(none)"
+    print(f"[PUSH] Registered token: {token[:16]}... platform={platform} username={uname_log}")
 
     return jsonify({"success": True})
 

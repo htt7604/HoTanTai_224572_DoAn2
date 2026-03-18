@@ -48,7 +48,7 @@ public class SmartHomeFirebaseMessagingService extends FirebaseMessagingService 
     @Override
     public void onNewToken(String token) {
         super.onNewToken(token);
-        PushTokenRegistrar.register(getApplicationContext(), token);
+        PushTokenRegistrar.register(getApplicationContext(), token, null, true);
     }
 
     private void showNotification(String title, String message) {

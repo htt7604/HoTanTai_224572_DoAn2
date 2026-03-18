@@ -586,10 +586,12 @@
         const API_BASE = window.location.origin;
         let updateInterval;
         let isListening = false;
+        let isUpdatingData = false;
         let wakeHideTimeout = null;
         let deviceNameMap = {};
         let toastHideTimeout = null;
         let esp32Connected = false;
+        const SENSOR_POLL_INTERVAL_MS = 3000;
 
         function setControlEnabled(enabled) {
             const controlSelectors = [
@@ -703,7 +705,6 @@
                 }
 
                 await updateData();
-                setTimeout(updateData, 800);
                 showToast(successMessage, 'success');
             } catch (error) {
                 if (typeof onError === 'function') {
@@ -726,6 +727,88 @@
             const micButton = document.getElementById('micButton');
             const voiceStatus = document.getElementById('voiceStatus');
             const voiceTranscript = document.getElementById('voiceTranscript');
+            const BrowserSpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+            if (!BrowserSpeechRecognition) {
+                micButton.disabled = true;
+                voiceStatus.textContent = 'Trình duyệt không hỗ trợ nhận diện giọng nói.';
+                return;
+            }
+
+            const recognition = new BrowserSpeechRecognition();
+            recognition.lang = 'vi-VN';
+            recognition.interimResults = false;
+            recognition.maxAlternatives = 1;
+
+            const speakOnWeb = (text) => {
+                const message = (text || '').trim();
+                if (!message || !('speechSynthesis' in window)) {
+                    return;
+                }
+
+                try {
+                    window.speechSynthesis.cancel();
+                    const utterance = new SpeechSynthesisUtterance(message);
+                    utterance.lang = 'vi-VN';
+                    utterance.rate = 1.0;
+                    utterance.pitch = 1.0;
+                    window.speechSynthesis.speak(utterance);
+                } catch (error) {
+                    console.error('speechSynthesis error:', error);
+                }
+            };
+
+            const sendVoiceTextToServer = async (spokenText) => {
+                try {
+                    const response = await fetch(`${API_BASE}/ai/process`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ text: spokenText })
+                    });
+
+                    const result = await response.json();
+                    if (result && result.success) {
+                        const command = result.command || '--';
+                        const responseText = result.response_text || 'Đã thực hiện lệnh';
+                        voiceStatus.textContent = `Đã gửi lệnh: ${command}`;
+                        speakOnWeb(responseText);
+                        await updateData();
+                        return;
+                    }
+
+                    voiceStatus.textContent = (result && result.message) ? result.message : 'Không nhận diện được lệnh';
+                    if (result && result.response_text) {
+                        speakOnWeb(result.response_text);
+                    }
+                } catch (error) {
+                    voiceStatus.textContent = 'Lỗi gửi text lên server: ' + error.message;
+                }
+            };
+
+            recognition.onresult = async (event) => {
+                const transcript = (((event.results || [])[0] || [])[0] || {}).transcript || '';
+                const spokenText = transcript.trim();
+
+                if (!spokenText) {
+                    voiceStatus.textContent = 'Không nhận diện được giọng nói.';
+                    voiceTranscript.innerHTML = 'Bạn nói: <span>--</span>';
+                    return;
+                }
+
+                voiceTranscript.innerHTML = `Bạn nói: <span>${spokenText}</span>`;
+                voiceStatus.textContent = 'Đang gửi text lên server...';
+                await sendVoiceTextToServer(spokenText);
+            };
+
+            recognition.onerror = (event) => {
+                voiceStatus.textContent = 'Lỗi nhận diện giọng nói: ' + (event.error || 'unknown');
+            };
+
+            recognition.onend = () => {
+                isListening = false;
+                micButton.classList.remove('listening');
+                micButton.disabled = false;
+            };
 
             micButton.addEventListener('click', async () => {
                 if (isListening) return;
@@ -736,29 +819,16 @@
                 isListening = true;
                 micButton.classList.add('listening');
                 micButton.disabled = true;
-                voiceStatus.textContent = 'Đang nghe ở server...';
+                voiceStatus.textContent = 'Đang nghe trên trình duyệt...';
                 voiceTranscript.innerHTML = 'Bạn nói: <span>--</span>';
 
                 try {
-                    const response = await fetch(`${API_BASE}/voice/once`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' }
-                    });
-                    const result = await response.json();
-                    if (result && result.text) {
-                        voiceTranscript.innerHTML = `Bạn nói: <span>${result.text}</span>`;
-                    }
-                    if (result && result.success) {
-                        voiceStatus.textContent = `Đã gửi lệnh: ${result.command}`;
-                    } else {
-                        voiceStatus.textContent = result.message || 'Không nhận diện được lệnh';
-                    }
+                    recognition.start();
                 } catch (error) {
-                    voiceStatus.textContent = 'Lỗi: ' + error.message;
-                } finally {
                     isListening = false;
                     micButton.classList.remove('listening');
                     micButton.disabled = false;
+                    voiceStatus.textContent = 'Không thể bắt đầu nhận diện giọng nói: ' + error.message;
                 }
             });
         }
@@ -872,6 +942,10 @@
         }
 
         async function updateData() {
+            if (isUpdatingData) {
+                return;
+            }
+            isUpdatingData = true;
             try {
                 const response = await fetch(`${API_BASE}/sensor/latest`);
                 const data = await response.json();
@@ -929,6 +1003,8 @@
             } catch (error) {
                 console.error('Error:', error);
                 applyConnectionState(false, 'Lỗi kết nối server');
+            } finally {
+                isUpdatingData = false;
             }
         }
 
@@ -1040,8 +1116,7 @@
         initVoiceButton();
         loadDeviceNames();
         updateData();
-        updateInterval = setInterval(updateData, 2000); // Cập nhật mỗi 2 giây
-        setInterval(checkWakeWord, 1000);
+        updateInterval = setInterval(updateData, SENSOR_POLL_INTERVAL_MS);
     </script>
 </body>
 </html>

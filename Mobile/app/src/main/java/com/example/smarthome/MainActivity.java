@@ -586,13 +586,15 @@ public class MainActivity extends AppCompatActivity {
 
     private void registerPushTokenIfPossible() {
         try {
+            String username = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .getString("auth_username", "");
             FirebaseMessaging.getInstance().getToken()
                     .addOnCompleteListener(task -> {
                         if (!task.isSuccessful()) {
                             return;
                         }
                         String token = task.getResult();
-                        PushTokenRegistrar.register(getApplicationContext(), token);
+                        PushTokenRegistrar.register(getApplicationContext(), token, username, false);
                     });
         } catch (Exception ignored) {
         }
