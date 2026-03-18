@@ -93,7 +93,7 @@ public class LoginActivity extends AppCompatActivity {
         String username = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(KEY_AUTH_USERNAME, "");
         boolean remember = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(KEY_AUTH_REMEMBER, false);
 
-        etBaseUrl.setText(baseUrl);
+        etBaseUrl.setText(sanitizeBaseUrl(baseUrl));
         etUsername.setText(username);
         cbRemember.setChecked(remember);
     }
@@ -143,7 +143,7 @@ public class LoginActivity extends AppCompatActivity {
         httpClient.newCall(request).enqueue(new Callback() {
             @Override
             public void onFailure(Call call, IOException e) {
-                runOnUiThread(() -> tvStatus.setText("Lỗi kết nối: " + e.getMessage()));
+                runOnUiThread(() -> tvStatus.setText("Lỗi kết nối: " + e.getMessage() + getConnectionHint()));
             }
 
             @Override
@@ -153,7 +153,8 @@ public class LoginActivity extends AppCompatActivity {
                     try {
                         JSONObject data = responseBody.isEmpty() ? new JSONObject() : new JSONObject(responseBody);
                         if (!response.isSuccessful() || !data.optBoolean("success", false)) {
-                            tvStatus.setText("Đăng nhập thất bại: " + data.optString("error", "Sai thông tin"));
+                            String err = data.optString("error", "Sai thông tin");
+                            tvStatus.setText("Đăng nhập thất bại (" + response.code() + "): " + err + getConnectionHint());
                             return;
                         }
 
@@ -210,7 +211,22 @@ public class LoginActivity extends AppCompatActivity {
         if (trimmed.isEmpty()) {
             return DEFAULT_BASE_URL;
         }
+        if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) {
+            trimmed = "http://" + trimmed;
+        }
+        String lower = trimmed.toLowerCase(Locale.US);
+        if (lower.contains("127.0.0.1") || lower.contains("localhost") || lower.contains("10.0.2.2")) {
+            return DEFAULT_BASE_URL;
+        }
         return trimmed;
+    }
+
+    private String getConnectionHint() {
+        String baseUrl = sanitizeBaseUrl(etBaseUrl.getText().toString()).toLowerCase(Locale.US);
+        if (baseUrl.contains("127.0.0.1") || baseUrl.contains("localhost") || baseUrl.contains("10.0.2.2")) {
+            return " | Base URL đang là cục bộ, hãy dùng IP public VPS";
+        }
+        return "";
     }
 
     private String sha256Hex(String input) {
