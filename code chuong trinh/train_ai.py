@@ -2,6 +2,10 @@ import json
 import os
 from pymongo import MongoClient
 from ai_engine import SmartHomeAI
+try:
+    import certifi
+except Exception:
+    certifi = None
 
 
 ENV_FILE = os.path.join(os.path.dirname(__file__), ".env")
@@ -28,7 +32,15 @@ def main():
     # Kết nối MongoDB
     mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017/").strip()
     mongo_db_name = os.getenv("MONGO_DB_NAME", "iot_db").strip() or "iot_db"
-    mongo = MongoClient(mongo_uri)
+    mongo_options = {
+        "serverSelectionTimeoutMS": int(os.getenv("MONGO_SERVER_SELECTION_TIMEOUT_MS", "30000")),
+        "connectTimeoutMS": int(os.getenv("MONGO_CONNECT_TIMEOUT_MS", "20000")),
+        "socketTimeoutMS": int(os.getenv("MONGO_SOCKET_TIMEOUT_MS", "20000"))
+    }
+    if mongo_uri.startswith("mongodb+srv://") and certifi is not None:
+        mongo_options["tlsCAFile"] = certifi.where()
+
+    mongo = MongoClient(mongo_uri, **mongo_options)
     db = mongo[mongo_db_name]
 
     # Khởi tạo AI

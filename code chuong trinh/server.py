@@ -12,6 +12,10 @@ from ai_engine import SmartHomeAI
 import re
 import hashlib
 try:
+    import certifi
+except Exception:
+    certifi = None
+try:
     import requests
 except Exception:
     requests = None
@@ -51,7 +55,16 @@ load_env_file(ENV_FILE)
 # ================== MONGODB ==================
 mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017/").strip()
 mongo_db_name = os.getenv("MONGO_DB_NAME", "iot_db").strip() or "iot_db"
-mongo = MongoClient(mongo_uri)
+mongo_options = {
+    "serverSelectionTimeoutMS": int(os.getenv("MONGO_SERVER_SELECTION_TIMEOUT_MS", "30000")),
+    "connectTimeoutMS": int(os.getenv("MONGO_CONNECT_TIMEOUT_MS", "20000")),
+    "socketTimeoutMS": int(os.getenv("MONGO_SOCKET_TIMEOUT_MS", "20000"))
+}
+
+if mongo_uri.startswith("mongodb+srv://") and certifi is not None:
+    mongo_options["tlsCAFile"] = certifi.where()
+
+mongo = MongoClient(mongo_uri, **mongo_options)
 db = mongo[mongo_db_name]
 collection_sensor = db["sensor_data"]  # Dữ liệu cảm biến định kỳ
 collection_events = db["events"]  # Sự kiện quan trọng
