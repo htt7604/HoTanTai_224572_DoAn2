@@ -91,6 +91,11 @@ collection_rfid_scans.create_index("uid")
 collection_door_password.create_index("slot", unique=True)
 
 print(f"MongoDB connected: {mongo_db_name}")
+try:
+    mongo.admin.command("ping")
+    print("MongoDB ping: OK")
+except Exception as e:
+    print(f"MongoDB ping failed: {e}")
 
 
 def _sha256_hex(raw_text: str):
@@ -154,10 +159,14 @@ def _get_door_password_hash():
     value = doc.get("pwd_sha256") or doc.get("password_hash")
     if value is None:
         return None
-    return str(value).strip().lower()
+    normalized = str(value).strip().lower()
+    if _is_valid_sha256_hex(normalized):
+        return normalized
+    return None
 
 
 def _set_door_password_hash(hash_value: str, source: str = "manual"):
+    hash_value = (hash_value or "").strip().lower()
     collection_door_password.update_one(
         {"slot": "main"},
         {
@@ -410,6 +419,11 @@ def _handle_password_hash_check(payload):
         return
 
     incoming_hash = _normalize_hash(data.get("hash"))
+    if not _is_valid_sha256_hex(incoming_hash):
+        mqtt_client.publish(MQTT_TOPIC_PASSWORD_RESULT, "FAIL")
+        save_event("PASSWORD_FAIL", "Hash mật khẩu keypad không hợp lệ", {"source": "esp32/password"})
+        return
+
     stored_hash = _find_stored_password_hash()
     is_valid = bool(incoming_hash and stored_hash and incoming_hash == stored_hash)
 
@@ -1219,11 +1233,14 @@ def get_door_password_info():
 @app.route("/door-password", methods=["POST"])
 def update_door_password():
     data = request.json or {}
-    old_hash = _normalize_hash(data.get("old_password_hash"))
-    new_hash = _normalize_hash(data.get("new_password_hash"))
+    old_hash = _resolve_password_hash(data, "old_password", "old_password_hash")
+    new_hash = _resolve_password_hash(data, "new_password", "new_password_hash")
 
     if not new_hash:
-        return jsonify({"success": False, "error": "new_password_hash là bắt buộc"}), 400
+        return jsonify({"success": False, "error": "new_password/new_password_hash là bắt buộc"}), 400
+
+    if not _is_valid_sha256_hex(new_hash):
+        return jsonify({"success": False, "error": "Mật khẩu mới không hợp lệ"}), 400
 
     current_hash = _get_door_password_hash()
     if current_hash and old_hash != current_hash:
@@ -1248,9 +1265,12 @@ def open_door_by_password():
         return offline_response
 
     data = request.json or {}
-    incoming_hash = _normalize_hash(data.get("password_hash"))
+    incoming_hash = _resolve_password_hash(data, "password", "password_hash")
     if not incoming_hash:
-        return jsonify({"success": False, "error": "password_hash là bắt buộc"}), 400
+        return jsonify({"success": False, "error": "password/password_hash là bắt buộc"}), 400
+
+    if not _is_valid_sha256_hex(incoming_hash):
+        return jsonify({"success": False, "error": "password_hash không hợp lệ"}), 400
 
     stored_hash = _find_stored_password_hash()
     if not stored_hash or incoming_hash != stored_hash:

@@ -53,6 +53,7 @@ import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Locale;
+import java.util.concurrent.TimeUnit;
 
 import okhttp3.Call;
 import okhttp3.Callback;
@@ -66,7 +67,7 @@ public class MainActivity extends AppCompatActivity {
 
     private static final String PREFS_NAME = "smarthome_prefs";
     private static final String KEY_BASE_URL = "base_url";
-    private static final String DEFAULT_BASE_URL = "http://10.0.2.2:5000";
+    private static final String DEFAULT_BASE_URL = "http://103.166.182.44:5000";
     private static final String KEY_DEVICE_NAMES_JSON = "device_names_json";
     private static final String KEY_AUTH_PASSWORD_HASH = "auth_password_hash";
     private static final String KEY_AUTH_REMEMBER = "auth_remember";
@@ -86,7 +87,12 @@ public class MainActivity extends AppCompatActivity {
             "door", "fan", "roof", "light1", "light2", "light3", "light4"
     };
 
-    private final OkHttpClient httpClient = new OkHttpClient();
+        private final OkHttpClient httpClient = new OkHttpClient.Builder()
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(8, TimeUnit.SECONDS)
+            .writeTimeout(8, TimeUnit.SECONDS)
+            .callTimeout(10, TimeUnit.SECONDS)
+            .build();
     private final Handler pollingHandler = new Handler(Looper.getMainLooper());
     private final Map<String, String> deviceNameMap = new HashMap<>();
     private static final int LIGHT_ON_ICON_COLOR = 0xFFFFC107;
@@ -117,6 +123,9 @@ public class MainActivity extends AppCompatActivity {
     private long lastDangerNotifyAtMs = 0L;
     private long lastNetworkErrorAtMs = 0L;
     private boolean networkDisconnectedState = false;
+    private boolean isSensorRequestRunning = false;
+    private long lastSensorStatusAtMs = 0L;
+    private static final long SENSOR_STATUS_INTERVAL_MS = 15000L;
 
     private final Handler wakeWordHandler = new Handler(Looper.getMainLooper());
     private final Runnable restartWakeWordRunnable = () -> {
@@ -570,7 +579,7 @@ public class MainActivity extends AppCompatActivity {
     private String getConnectionHint() {
         String baseUrl = getBaseUrl().toLowerCase(Locale.US);
         if (baseUrl.contains("127.0.0.1") || baseUrl.contains("localhost") || baseUrl.contains("10.0.2.2")) {
-            return " Bạn đang dùng URL cục bộ (localhost/127.0.0.1/10.0.2.2). Nếu chạy trên điện thoại thật, hãy đổi Base URL thành IP LAN của máy chạy server (ví dụ: http://192.168.2.84:5000).";
+            return " Bạn đang dùng URL cục bộ (localhost/127.0.0.1/10.0.2.2). Hãy đổi Base URL sang IP public/domain của VPS (ví dụ: http://103.166.182.44:5000).";
         }
         return "";
     }
@@ -1172,16 +1181,26 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void fetchLatestSensor() {
+        if (isSensorRequestRunning) {
+            return;
+        }
+        isSensorRequestRunning = true;
+
         Request request = new Request.Builder()
                 .url(getBaseUrl() + "/sensor/latest")
                 .get()
                 .build();
 
-        setStatus("Đang tải dữ liệu cảm biến...");
+        long nowMs = System.currentTimeMillis();
+        if ((nowMs - lastSensorStatusAtMs) >= SENSOR_STATUS_INTERVAL_MS) {
+            setStatus("Đang tải dữ liệu cảm biến...");
+            lastSensorStatusAtMs = nowMs;
+        }
 
         httpClient.newCall(request).enqueue(new Callback() {
             @Override
             public void onFailure(Call call, IOException e) {
+                isSensorRequestRunning = false;
                 showNetworkErrorThrottled("Cannot reach server: " + e.getMessage() + getConnectionHint());
             }
 
@@ -1189,6 +1208,7 @@ public class MainActivity extends AppCompatActivity {
             public void onResponse(Call call, Response response) throws IOException {
                 String responseBody = response.body() != null ? response.body().string() : "";
                 if (!response.isSuccessful()) {
+                    isSensorRequestRunning = false;
                     showError("Server error " + response.code() + ": " + responseBody);
                     return;
                 }
@@ -1199,10 +1219,11 @@ public class MainActivity extends AppCompatActivity {
                         networkDisconnectedState = false;
                         updateConnectionUi(!data.has("message"));
                         applySensorToUi(data);
-                        setStatus("Đã cập nhật dữ liệu cảm biến");
                     });
                 } catch (Exception e) {
                     showNetworkErrorThrottled("Bad sensor data: " + e.getMessage());
+                } finally {
+                    isSensorRequestRunning = false;
                 }
             }
         });

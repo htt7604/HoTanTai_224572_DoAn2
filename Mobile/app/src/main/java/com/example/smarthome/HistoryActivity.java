@@ -40,7 +40,7 @@ public class HistoryActivity extends AppCompatActivity {
 
     private static final String PREFS_NAME = "smarthome_prefs";
     private static final String KEY_BASE_URL = "base_url";
-    private static final String DEFAULT_BASE_URL = "http://10.0.2.2:5000";
+    private static final String DEFAULT_BASE_URL = "http://103.166.182.44:5000";
 
     private final OkHttpClient httpClient = new OkHttpClient();
     private final List<SensorHistoryItem> historyItems = new ArrayList<>();

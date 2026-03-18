@@ -43,7 +43,7 @@
                 android:layout_height="wrap_content"
                 android:layout_marginTop="16dp"
                 android:background="#FFFFFF"
-                android:hint="Server URL (emulator: http://10.0.2.2:5000 | phone: http://192.168.x.x:5000)"
+                android:hint="Server URL (ví dụ: http://103.166.182.44:5000)"
                 android:inputType="textUri"
                 android:padding="12dp"
                 android:textColor="#111111"

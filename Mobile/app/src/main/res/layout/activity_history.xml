@@ -60,7 +60,7 @@
                 android:layout_height="wrap_content"
                 android:layout_marginTop="6dp"
                 android:background="#FFFFFF"
-                android:hint="http://192.168.1.10:5000"
+                android:hint="http://103.166.182.44:5000"
                 android:inputType="textUri"
                 android:padding="12dp"
                 android:textColor="#111111"

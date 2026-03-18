@@ -15,6 +15,7 @@ import org.json.JSONObject;
 import java.io.IOException;
 import java.security.MessageDigest;
 import java.util.Locale;
+import java.util.concurrent.TimeUnit;
 
 import okhttp3.Call;
 import okhttp3.Callback;
@@ -32,10 +33,15 @@ public class LoginActivity extends AppCompatActivity {
     private static final String KEY_AUTH_PASSWORD_HASH = "auth_password_hash";
     private static final String KEY_AUTH_REMEMBER = "auth_remember";
     private static final String KEY_AUTH_LOGGED_IN = "auth_logged_in";
-    private static final String DEFAULT_BASE_URL = "http://10.0.2.2:5000";
+    private static final String DEFAULT_BASE_URL = "http://103.166.182.44:5000";
     private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
 
-    private final OkHttpClient httpClient = new OkHttpClient();
+        private final OkHttpClient httpClient = new OkHttpClient.Builder()
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(8, TimeUnit.SECONDS)
+            .writeTimeout(8, TimeUnit.SECONDS)
+            .callTimeout(10, TimeUnit.SECONDS)
+            .build();
 
     private EditText etBaseUrl;
     private EditText etUsername;
@@ -47,6 +53,14 @@ public class LoginActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_login);
+
+        if (getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(KEY_AUTH_LOGGED_IN, false)) {
+            Intent intent = new Intent(LoginActivity.this, MainActivity.class);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+            startActivity(intent);
+            finish();
+            return;
+        }
 
         bindViews();
         setupActions();
