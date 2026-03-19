@@ -18,12 +18,10 @@ import okhttp3.Response;
 public final class PushTokenRegistrar {
 
     private static final String PREFS_NAME = "smarthome_prefs";
-    private static final String KEY_BASE_URL = "base_url";
     private static final String KEY_AUTH_USERNAME = "auth_username";
     private static final String KEY_LAST_REGISTERED_TOKEN = "last_registered_fcm_token";
     private static final String KEY_LAST_REGISTERED_USERNAME = "last_registered_fcm_username";
     private static final String KEY_LAST_REGISTERED_BASE_URL = "last_registered_fcm_base_url";
-    private static final String DEFAULT_BASE_URL = "http://103.166.182.44:5000";
     private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
     private static final OkHttpClient HTTP = new OkHttpClient();
 
@@ -44,12 +42,7 @@ public final class PushTokenRegistrar {
                 ? prefs.getString(KEY_AUTH_USERNAME, "")
                 : username.trim().toLowerCase();
 
-        String baseUrl = prefs.getString(KEY_BASE_URL, DEFAULT_BASE_URL);
-        if (baseUrl == null) {
-            baseUrl = DEFAULT_BASE_URL;
-        }
-        baseUrl = sanitizeBaseUrl(baseUrl);
-        final String resolvedBaseUrl = baseUrl;
+        final String resolvedBaseUrl = ApiConfig.baseUrl();
         if (resolvedBaseUrl.contains("127.0.0.1") || resolvedBaseUrl.contains("localhost")) {
             return;
         }
@@ -96,13 +89,5 @@ public final class PushTokenRegistrar {
             });
         } catch (Exception ignored) {
         }
-    }
-
-    private static String sanitizeBaseUrl(String value) {
-        String trimmed = value.trim();
-        if (trimmed.endsWith("/")) {
-            trimmed = trimmed.substring(0, trimmed.length() - 1);
-        }
-        return trimmed;
     }
 }

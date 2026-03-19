@@ -29,13 +29,12 @@ import okhttp3.Response;
 
 public class LoginActivity extends AppCompatActivity {
 
-    private static final String PREFS_NAME = "smarthome_prefs";
-    private static final String KEY_BASE_URL = "base_url";
+    private static final String PREFS_NAME = AuthConfig.PREFS_NAME;
     private static final String KEY_AUTH_USERNAME = "auth_username";
     private static final String KEY_AUTH_PASSWORD_HASH = "auth_password_hash";
     private static final String KEY_AUTH_REMEMBER = "auth_remember";
     private static final String KEY_AUTH_LOGGED_IN = "auth_logged_in";
-    private static final String DEFAULT_BASE_URL = "http://103.166.182.44:5000";
+    private static final String KEY_AUTH_API_TOKEN = AuthConfig.KEY_AUTH_API_TOKEN;
     private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
 
         private final OkHttpClient httpClient = new OkHttpClient.Builder()
@@ -45,7 +44,6 @@ public class LoginActivity extends AppCompatActivity {
             .callTimeout(10, TimeUnit.SECONDS)
             .build();
 
-    private EditText etBaseUrl;
     private EditText etUsername;
     private EditText etPassword;
     private CheckBox cbRemember;
@@ -71,7 +69,6 @@ public class LoginActivity extends AppCompatActivity {
     }
 
     private void bindViews() {
-        etBaseUrl = findViewById(R.id.etLoginBaseUrl);
         etUsername = findViewById(R.id.etLoginUsername);
         etPassword = findViewById(R.id.etLoginPassword);
         cbRemember = findViewById(R.id.cbLoginRemember);
@@ -89,11 +86,9 @@ public class LoginActivity extends AppCompatActivity {
     }
 
     private void loadSavedData() {
-        String baseUrl = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(KEY_BASE_URL, DEFAULT_BASE_URL);
         String username = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(KEY_AUTH_USERNAME, "");
         boolean remember = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(KEY_AUTH_REMEMBER, false);
 
-        etBaseUrl.setText(sanitizeBaseUrl(baseUrl));
         etUsername.setText(username);
         cbRemember.setChecked(remember);
     }
@@ -123,7 +118,6 @@ public class LoginActivity extends AppCompatActivity {
     }
 
     private void doLogin(String username, String passwordHash, boolean remember) {
-        saveBaseUrl();
         tvStatus.setText("Đang đăng nhập...");
 
         JSONObject body = new JSONObject();
@@ -136,14 +130,14 @@ public class LoginActivity extends AppCompatActivity {
         }
 
         Request request = new Request.Builder()
-                .url(getBaseUrl() + "/auth/login")
+            .url(ApiConfig.baseUrl() + "/auth/login")
                 .post(RequestBody.create(body.toString(), JSON))
                 .build();
 
         httpClient.newCall(request).enqueue(new Callback() {
             @Override
             public void onFailure(Call call, IOException e) {
-                runOnUiThread(() -> tvStatus.setText("Lỗi kết nối: " + e.getMessage() + getConnectionHint()));
+                runOnUiThread(() -> tvStatus.setText("Lỗi kết nối: " + e.getMessage()));
             }
 
             @Override
@@ -154,7 +148,13 @@ public class LoginActivity extends AppCompatActivity {
                         JSONObject data = responseBody.isEmpty() ? new JSONObject() : new JSONObject(responseBody);
                         if (!response.isSuccessful() || !data.optBoolean("success", false)) {
                             String err = data.optString("error", "Sai thông tin");
-                            tvStatus.setText("Đăng nhập thất bại (" + response.code() + "): " + err + getConnectionHint());
+                            tvStatus.setText("Đăng nhập thất bại (" + response.code() + "): " + err);
+                            return;
+                        }
+
+                        String apiToken = data.optString("api_token", "").trim();
+                        if (apiToken.isEmpty()) {
+                            tvStatus.setText("Đăng nhập thất bại: server chưa trả api_token");
                             return;
                         }
 
@@ -163,6 +163,7 @@ public class LoginActivity extends AppCompatActivity {
                                 .putString(KEY_AUTH_USERNAME, username)
                                 .putBoolean(KEY_AUTH_LOGGED_IN, true)
                                 .putBoolean(KEY_AUTH_REMEMBER, remember)
+                                .putString(KEY_AUTH_API_TOKEN, apiToken)
                                 .putString(KEY_AUTH_PASSWORD_HASH, remember ? passwordHash : "")
                                 .apply();
 
@@ -188,45 +189,6 @@ public class LoginActivity extends AppCompatActivity {
                 });
             }
         });
-    }
-
-    private void saveBaseUrl() {
-        String baseUrl = sanitizeBaseUrl(etBaseUrl.getText().toString());
-        etBaseUrl.setText(baseUrl);
-        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-                .edit()
-                .putString(KEY_BASE_URL, baseUrl)
-                .apply();
-    }
-
-    private String getBaseUrl() {
-        return sanitizeBaseUrl(etBaseUrl.getText().toString());
-    }
-
-    private String sanitizeBaseUrl(String value) {
-        String trimmed = value == null ? "" : value.trim();
-        if (trimmed.endsWith("/")) {
-            trimmed = trimmed.substring(0, trimmed.length() - 1);
-        }
-        if (trimmed.isEmpty()) {
-            return DEFAULT_BASE_URL;
-        }
-        if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) {
-            trimmed = "http://" + trimmed;
-        }
-        String lower = trimmed.toLowerCase(Locale.US);
-        if (lower.contains("127.0.0.1") || lower.contains("localhost") || lower.contains("10.0.2.2")) {
-            return DEFAULT_BASE_URL;
-        }
-        return trimmed;
-    }
-
-    private String getConnectionHint() {
-        String baseUrl = sanitizeBaseUrl(etBaseUrl.getText().toString()).toLowerCase(Locale.US);
-        if (baseUrl.contains("127.0.0.1") || baseUrl.contains("localhost") || baseUrl.contains("10.0.2.2")) {
-            return " | Base URL đang là cục bộ, hãy dùng IP public VPS";
-        }
-        return "";
     }
 
     private String sha256Hex(String input) {

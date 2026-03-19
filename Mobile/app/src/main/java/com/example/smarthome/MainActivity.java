@@ -65,13 +65,12 @@ import okhttp3.Response;
 
 public class MainActivity extends AppCompatActivity {
 
-    private static final String PREFS_NAME = "smarthome_prefs";
-    private static final String KEY_BASE_URL = "base_url";
-    private static final String DEFAULT_BASE_URL = "http://103.166.182.44:5000";
+    private static final String PREFS_NAME = AuthConfig.PREFS_NAME;
     private static final String KEY_DEVICE_NAMES_JSON = "device_names_json";
     private static final String KEY_AUTH_PASSWORD_HASH = "auth_password_hash";
     private static final String KEY_AUTH_REMEMBER = "auth_remember";
     private static final String KEY_AUTH_LOGGED_IN = "auth_logged_in";
+    private static final String KEY_AUTH_API_TOKEN = AuthConfig.KEY_AUTH_API_TOKEN;
     private static final String WAKE_WORD = "nha oi";
     private static final long WAKE_COMMAND_WINDOW_MS = 5000L;
     private static final long POLLING_INTERVAL_MS = 2000L;
@@ -162,7 +161,6 @@ public class MainActivity extends AppCompatActivity {
         }
     };
 
-    private EditText etBaseUrl;
     private EditText etDoorPassword;
     private EditText etDeviceName;
     private Spinner spDeviceKey;
@@ -235,7 +233,6 @@ public class MainActivity extends AppCompatActivity {
         setupDeviceSpinner();
         initTextToSpeech();
         initWakeWordRecognizer();
-        loadSavedBaseUrl();
         registerPushTokenIfPossible();
         loadCachedDeviceNames();
         applyDeviceNamesToUi();
@@ -349,7 +346,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void bindViews() {
-        etBaseUrl = findViewById(R.id.etBaseUrl);
         etDoorPassword = findViewById(R.id.etDoorPassword);
         etDeviceName = findViewById(R.id.etDeviceName);
         spDeviceKey = findViewById(R.id.spDeviceKey);
@@ -398,7 +394,6 @@ public class MainActivity extends AppCompatActivity {
         Button btnManageRfid = findViewById(R.id.btnManageRfid);
         Button btnManageDoorPassword = findViewById(R.id.btnManageDoorPassword);
         Button btnLogoutMain = findViewById(R.id.btnLogoutMain);
-        Button btnSaveBaseUrl = findViewById(R.id.btnSaveBaseUrl);
         Button btnDoorOpen = findViewById(R.id.btnDoorOpen);
         Button btnDoorClose = findViewById(R.id.btnDoorClose);
         Button btnFanOn = findViewById(R.id.btnFanOn);
@@ -426,12 +421,6 @@ public class MainActivity extends AppCompatActivity {
         });
 
         btnLogoutMain.setOnClickListener(v -> logoutUser());
-
-        btnSaveBaseUrl.setOnClickListener(v -> {
-            saveBaseUrl();
-            registerPushTokenIfPossible();
-            fetchLatestSensor();
-        });
 
         btnDoorOpen.setOnClickListener(v -> {
             if (!ensureAuthenticated()) return;
@@ -541,47 +530,22 @@ public class MainActivity extends AppCompatActivity {
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
                 .edit()
                 .remove(KEY_AUTH_PASSWORD_HASH)
+            .remove(KEY_AUTH_API_TOKEN)
                 .putBoolean(KEY_AUTH_REMEMBER, false)
                 .apply();
     }
 
-    private void loadSavedBaseUrl() {
-        String baseUrl = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-                .getString(KEY_BASE_URL, DEFAULT_BASE_URL);
-        etBaseUrl.setText(baseUrl);
-    }
-
-    private void saveBaseUrl() {
-        String baseUrl = sanitizeBaseUrl(etBaseUrl.getText().toString());
-        etBaseUrl.setText(baseUrl);
-        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-                .edit()
-                .putString(KEY_BASE_URL, baseUrl)
-                .apply();
-        setStatus("Saved server: " + baseUrl);
-    }
-
-    private String sanitizeBaseUrl(String value) {
-        String trimmed = value == null ? "" : value.trim();
-        if (trimmed.endsWith("/")) {
-            trimmed = trimmed.substring(0, trimmed.length() - 1);
-        }
-        if (trimmed.isEmpty()) {
-            return DEFAULT_BASE_URL;
-        }
-        return trimmed;
-    }
-
     private String getBaseUrl() {
-        return sanitizeBaseUrl(etBaseUrl.getText().toString());
+        return ApiConfig.baseUrl();
     }
 
     private String getConnectionHint() {
-        String baseUrl = getBaseUrl().toLowerCase(Locale.US);
-        if (baseUrl.contains("127.0.0.1") || baseUrl.contains("localhost") || baseUrl.contains("10.0.2.2")) {
-            return " Bạn đang dùng URL cục bộ (localhost/127.0.0.1/10.0.2.2). Hãy đổi Base URL sang IP public/domain của VPS (ví dụ: http://103.166.182.44:5000).";
-        }
         return "";
+    }
+
+    private Request.Builder authorizedRequestBuilder(String url) {
+        Request.Builder builder = new Request.Builder().url(url);
+        return AuthConfig.applyAuthHeader(this, builder);
     }
 
     private void registerPushTokenIfPossible() {
@@ -611,8 +575,7 @@ public class MainActivity extends AppCompatActivity {
             JSONObject body = new JSONObject();
             body.put("password_hash", sha256Hex(password));
 
-            Request request = new Request.Builder()
-                    .url(getBaseUrl() + "/door/open-by-password")
+                Request request = authorizedRequestBuilder(getBaseUrl() + "/door/open-by-password")
                     .post(RequestBody.create(body.toString(), JSON))
                     .build();
 
@@ -978,8 +941,7 @@ public class MainActivity extends AppCompatActivity {
             JSONObject body = new JSONObject();
             body.put("text", spokenWakeText == null ? "nhà ơi" : spokenWakeText);
 
-            Request request = new Request.Builder()
-                    .url(getBaseUrl() + "/ai/wake")
+                Request request = authorizedRequestBuilder(getBaseUrl() + "/ai/wake")
                     .post(RequestBody.create(body.toString(), JSON))
                     .build();
 
@@ -1077,8 +1039,7 @@ public class MainActivity extends AppCompatActivity {
             JSONObject body = new JSONObject();
             body.put("text", spokenText);
 
-            Request request = new Request.Builder()
-                    .url(getBaseUrl() + "/ai/process")
+                Request request = authorizedRequestBuilder(getBaseUrl() + "/ai/process")
                     .post(RequestBody.create(body.toString(), JSON))
                     .build();
 
@@ -1188,8 +1149,7 @@ public class MainActivity extends AppCompatActivity {
         }
         isSensorRequestRunning = true;
 
-        Request request = new Request.Builder()
-                .url(getBaseUrl() + "/sensor/latest")
+        Request request = authorizedRequestBuilder(getBaseUrl() + "/sensor/latest")
                 .get()
                 .build();
 
@@ -1431,8 +1391,7 @@ public class MainActivity extends AppCompatActivity {
 
     private void postJson(String endpoint, JSONObject body, String successMessage) {
         RequestBody requestBody = RequestBody.create(body.toString(), JSON);
-        Request request = new Request.Builder()
-                .url(getBaseUrl() + endpoint)
+        Request request = authorizedRequestBuilder(getBaseUrl() + endpoint)
                 .post(requestBody)
                 .build();
 
@@ -1462,8 +1421,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void loadDeviceNames() {
-        Request request = new Request.Builder()
-                .url(getBaseUrl() + "/devices/names")
+        Request request = authorizedRequestBuilder(getBaseUrl() + "/devices/names")
                 .get()
                 .build();
 
@@ -1531,8 +1489,7 @@ public class MainActivity extends AppCompatActivity {
             body.put("device", deviceKey);
             body.put("display_name", displayName);
 
-            Request request = new Request.Builder()
-                    .url(getBaseUrl() + "/devices/names")
+                Request request = authorizedRequestBuilder(getBaseUrl() + "/devices/names")
                     .post(RequestBody.create(body.toString(), JSON))
                     .build();
 

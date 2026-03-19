@@ -24,9 +24,6 @@ import okhttp3.Response;
 
 public class ChangePasswordActivity extends AppCompatActivity {
 
-    private static final String PREFS_NAME = "smarthome_prefs";
-    private static final String KEY_BASE_URL = "base_url";
-    private static final String DEFAULT_BASE_URL = "http://103.166.182.44:5000";
     private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
 
     private final OkHttpClient httpClient = new OkHttpClient();
@@ -109,13 +106,7 @@ public class ChangePasswordActivity extends AppCompatActivity {
     }
 
     private String getBaseUrl() {
-        String baseUrl = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(KEY_BASE_URL, DEFAULT_BASE_URL);
-        if (baseUrl == null) return DEFAULT_BASE_URL;
-        String trimmed = baseUrl.trim();
-        if (trimmed.endsWith("/")) {
-            trimmed = trimmed.substring(0, trimmed.length() - 1);
-        }
-        return trimmed.isEmpty() ? DEFAULT_BASE_URL : trimmed;
+        return ApiConfig.baseUrl();
     }
 
     private String sha256Hex(String input) {

@@ -38,14 +38,9 @@ import okhttp3.Response;
 
 public class HistoryActivity extends AppCompatActivity {
 
-    private static final String PREFS_NAME = "smarthome_prefs";
-    private static final String KEY_BASE_URL = "base_url";
-    private static final String DEFAULT_BASE_URL = "http://103.166.182.44:5000";
-
     private final OkHttpClient httpClient = new OkHttpClient();
     private final List<SensorHistoryItem> historyItems = new ArrayList<>();
 
-    private EditText etBaseUrlHistory;
     private Spinner spPeriod;
     private EditText etPeriodValue;
     private TextView tvHistorySummary;
@@ -61,7 +56,6 @@ public class HistoryActivity extends AppCompatActivity {
         bindViews();
         setupWindowInsets();
         setupPeriodSpinner();
-        loadSavedBaseUrl();
         setupActions();
 
         updatePeriodInputUi();
@@ -69,7 +63,6 @@ public class HistoryActivity extends AppCompatActivity {
     }
 
     private void bindViews() {
-        etBaseUrlHistory = findViewById(R.id.etBaseUrlHistory);
         spPeriod = findViewById(R.id.spPeriod);
         etPeriodValue = findViewById(R.id.etPeriodValue);
         tvHistorySummary = findViewById(R.id.tvHistorySummary);
@@ -119,25 +112,13 @@ public class HistoryActivity extends AppCompatActivity {
         });
     }
 
-    private void loadSavedBaseUrl() {
-        String baseUrl = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-                .getString(KEY_BASE_URL, DEFAULT_BASE_URL);
-        etBaseUrlHistory.setText(baseUrl);
-    }
-
-    private String sanitizeBaseUrl(String value) {
-        String trimmed = value == null ? "" : value.trim();
-        if (trimmed.endsWith("/")) {
-            trimmed = trimmed.substring(0, trimmed.length() - 1);
-        }
-        if (trimmed.isEmpty()) {
-            return DEFAULT_BASE_URL;
-        }
-        return trimmed;
-    }
-
     private String getBaseUrl() {
-        return sanitizeBaseUrl(etBaseUrlHistory.getText().toString());
+        return ApiConfig.baseUrl();
+    }
+
+    private Request.Builder authorizedRequestBuilder(String url) {
+        Request.Builder builder = new Request.Builder().url(url);
+        return AuthConfig.applyAuthHeader(this, builder);
     }
 
     private void updatePeriodInputUi() {
@@ -224,8 +205,7 @@ public class HistoryActivity extends AppCompatActivity {
     }
 
     private void fetchHistory(String url, String summaryPrefix) {
-        Request request = new Request.Builder()
-                .url(url)
+        Request request = authorizedRequestBuilder(url)
                 .get()
                 .build();
 
@@ -235,7 +215,7 @@ public class HistoryActivity extends AppCompatActivity {
                 runOnUiThread(() -> {
                     setStatus("Lỗi kết nối: " + e.getMessage());
                     Toast.makeText(HistoryActivity.this,
-                            "Không kết nối được server. Hãy kiểm tra Base URL.",
+                            "Không kết nối được server.",
                             Toast.LENGTH_LONG).show();
                 });
             }
