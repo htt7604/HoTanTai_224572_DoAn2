@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request, render_template, send_from_directory
+from flask import Flask, jsonify, request, render_template, send_from_directory, session, redirect, url_for
 from flask_cors import CORS
 from pymongo import MongoClient
 import paho.mqtt.client as mqtt
@@ -11,6 +11,7 @@ import time
 from ai_engine import SmartHomeAI
 import re
 import hashlib
+import secrets
 try:
     import certifi
 except Exception:
@@ -74,6 +75,7 @@ collection_ai_alias = db["ai_alias"]  # Alias người dùng đặt cho thiết 
 collection_device_names = db["device_names"]  # Tên hiển thị thiết bị do người dùng đặt
 collection_mobile_push_tokens = db["mobile_push_tokens"]  # Token FCM từ mobile
 collection_users = db["users"]  # Tài khoản đăng nhập app
+collection_password_resets = db["password_resets"]  # Token quên mật khẩu cho web/app
 collection_rfid_cards = db["rfid_cards"]  # Thẻ RFID hợp lệ để mở cửa
 collection_rfid_scans = db["rfid_scans"]  # Lịch sử quét RFID
 collection_door_password = db["door_password"]  # Mật khẩu mở cửa
@@ -85,6 +87,8 @@ collection_events.create_index("event_type")
 collection_user_actions.create_index("timestamp")
 collection_mobile_push_tokens.create_index("token", unique=True)
 collection_users.create_index("username", unique=True)
+collection_password_resets.create_index("token_hash", unique=True)
+collection_password_resets.create_index("expires_at")
 collection_rfid_cards.create_index("slot", unique=True)
 collection_rfid_scans.create_index("timestamp")
 collection_rfid_scans.create_index("uid")
@@ -315,6 +319,10 @@ ai_engine = SmartHomeAI(db)
 # ================== FLASK ==================
 app = Flask(__name__, template_folder='templates')
 CORS(app)  # Cho phép CORS để web app có thể gọi API
+app.secret_key = os.getenv("FLASK_SECRET_KEY", os.getenv("APP_SECRET_KEY", "change-this-in-production"))
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = os.getenv("SESSION_COOKIE_SECURE", "1") == "1"
 
 # ================== MQTT ==================
 MQTT_BROKER = "3c5308fe02794486932d547731382984.s1.eu.hivemq.cloud"
@@ -1466,13 +1474,137 @@ def _resolve_password_hash(payload: dict, password_field: str, hash_field: str):
     return None
 
 
+def _hash_reset_token(token: str):
+    return _sha256_hex(token or "")
+
+
+def _is_session_authenticated():
+    return bool(session.get("auth_user"))
+
+
+def _get_auth_user():
+    return (session.get("auth_user") or "").strip().lower()
+
+
+def _is_authorized_request():
+    if _is_session_authenticated():
+        return True
+
+    auth_header = (request.headers.get("Authorization") or "").strip()
+    token = ""
+    if auth_header.lower().startswith("bearer "):
+        token = auth_header[7:].strip()
+    if not token:
+        token = (request.headers.get("X-Auth-Token") or "").strip()
+    if not token:
+        return False
+
+    token_hash = _hash_reset_token(token)
+    now = datetime.now()
+    user = collection_users.find_one({
+        "api_token_hash": token_hash,
+        "api_token_expires_at": {"$gt": now}
+    })
+    if not user:
+        return False
+
+    session["auth_user"] = user.get("username")
+    session["auth_at"] = now.isoformat()
+    return True
+
+
+def _is_public_route(path: str):
+    public_exact = {
+        "/login",
+        "/register",
+        "/forgot-password",
+        "/reset-password",
+        "/logout",
+        "/favicon.ico"
+    }
+    if path in public_exact:
+        return True
+
+    public_prefixes = (
+        "/auth/",
+        "/mobile/",
+        "/static/"
+    )
+    return path.startswith(public_prefixes)
+
+
+@app.before_request
+def enforce_authentication():
+    path = request.path or "/"
+    if _is_public_route(path):
+        return None
+
+    if _is_authorized_request():
+        return None
+
+    if path.startswith("/api/") or request.method in {"POST", "PUT", "PATCH", "DELETE"} or request.is_json:
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+
+    return redirect(url_for("login_page", next=path))
+
+
+def _issue_api_token_for_user(username: str):
+    token = secrets.token_urlsafe(32)
+    token_hash = _hash_reset_token(token)
+    expire_at = datetime.now() + timedelta(days=7)
+    collection_users.update_one(
+        {"username": username},
+        {"$set": {
+            "api_token_hash": token_hash,
+            "api_token_expires_at": expire_at,
+            "updated_at": datetime.now()
+        }}
+    )
+    return token, expire_at
+
+
 # ================== AUTH ROUTES ==================
+
+@app.route("/login")
+def login_page():
+    if _is_session_authenticated():
+        return redirect(url_for("index"))
+    return render_template("login.html")
+
+
+@app.route("/register")
+def register_page():
+    if _is_session_authenticated():
+        return redirect(url_for("index"))
+    return render_template("register.html")
+
+
+@app.route("/forgot-password")
+def forgot_password_page():
+    if _is_session_authenticated():
+        return redirect(url_for("index"))
+    return render_template("forgot_password.html")
+
+
+@app.route("/reset-password")
+def reset_password_page():
+    if _is_session_authenticated():
+        return redirect(url_for("index"))
+    return render_template("reset_password.html")
+
+
+@app.route("/logout", methods=["GET", "POST"])
+def auth_logout_web():
+    session.clear()
+    return redirect(url_for("login_page"))
 
 @app.route("/auth/register", methods=["POST"])
 def auth_register():
     data = request.json or {}
     username = _normalize_username(data.get("username"))
     password_hash = _resolve_password_hash(data, "password", "password_hash")
+    recovery_answer = (data.get("recovery_answer") or "").strip()
+    recovery_hash = _sha256_hex(recovery_answer) if recovery_answer else None
 
     if not username:
         return jsonify({"success": False, "error": "username là bắt buộc"}), 400
@@ -1485,6 +1617,7 @@ def auth_register():
     collection_users.insert_one({
         "username": username,
         "pwd_sha256": password_hash,
+        "recovery_hash": recovery_hash,
         "created_at": datetime.now(),
         "updated_at": datetime.now()
     })
@@ -1505,7 +1638,24 @@ def auth_login():
     if not user or user.get("pwd_sha256") != password_hash:
         return jsonify({"success": False, "error": "Sai tài khoản hoặc mật khẩu"}), 401
 
-    return jsonify({"success": True, "username": username})
+    now = datetime.now()
+    session["auth_user"] = username
+    session["auth_at"] = now.isoformat()
+    token, expire_at = _issue_api_token_for_user(username)
+
+    return jsonify({
+        "success": True,
+        "username": username,
+        "api_token": token,
+        "api_token_expires_at": expire_at.isoformat()
+    })
+
+
+@app.route("/auth/me", methods=["GET"])
+def auth_me():
+    if not _is_authorized_request():
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    return jsonify({"success": True, "username": _get_auth_user()})
 
 
 @app.route("/auth/change-password", methods=["POST"])
@@ -1525,6 +1675,94 @@ def auth_change_password():
     collection_users.update_one(
         {"username": username},
         {"$set": {"pwd_sha256": new_password_hash, "updated_at": datetime.now()}}
+    )
+
+    return jsonify({"success": True, "username": username})
+
+
+@app.route("/auth/forgot-password", methods=["POST"])
+def auth_forgot_password():
+    data = request.json or {}
+    username = _normalize_username(data.get("username"))
+    recovery_answer = (data.get("recovery_answer") or "").strip()
+
+    if not username or not recovery_answer:
+        return jsonify({"success": False, "error": "Thiếu username hoặc recovery_answer"}), 400
+
+    user = collection_users.find_one({"username": username})
+    if not user:
+        return jsonify({"success": False, "error": "Không tìm thấy tài khoản"}), 404
+
+    stored_recovery_hash = (user.get("recovery_hash") or "").strip().lower()
+    if not stored_recovery_hash:
+        return jsonify({
+            "success": False,
+            "error": "Tài khoản chưa có recovery_answer, hãy đổi mật khẩu khi đang đăng nhập"
+        }), 400
+
+    if stored_recovery_hash != _sha256_hex(recovery_answer):
+        return jsonify({"success": False, "error": "Recovery answer không đúng"}), 401
+
+    reset_token = secrets.token_urlsafe(24)
+    token_hash = _hash_reset_token(reset_token)
+    expire_at = datetime.now() + timedelta(minutes=15)
+
+    collection_password_resets.update_one(
+        {"username": username},
+        {
+            "$set": {
+                "token_hash": token_hash,
+                "expires_at": expire_at,
+                "used": False,
+                "updated_at": datetime.now()
+            },
+            "$setOnInsert": {
+                "created_at": datetime.now()
+            }
+        },
+        upsert=True
+    )
+
+    return jsonify({
+        "success": True,
+        "username": username,
+        "reset_token": reset_token,
+        "expires_at": expire_at.isoformat()
+    })
+
+
+@app.route("/auth/reset-password", methods=["POST"])
+def auth_reset_password():
+    data = request.json or {}
+    username = _normalize_username(data.get("username"))
+    reset_token = (data.get("reset_token") or "").strip()
+    new_password_hash = _resolve_password_hash(data, "new_password", "new_password_hash")
+
+    if not username or not reset_token or not new_password_hash:
+        return jsonify({"success": False, "error": "Thiếu username, reset_token hoặc mật khẩu mới"}), 400
+
+    record = collection_password_resets.find_one({"username": username})
+    if not record:
+        return jsonify({"success": False, "error": "Không có yêu cầu reset hợp lệ"}), 404
+
+    if record.get("used"):
+        return jsonify({"success": False, "error": "Reset token đã được sử dụng"}), 400
+
+    expires_at = record.get("expires_at")
+    if not expires_at or expires_at <= datetime.now():
+        return jsonify({"success": False, "error": "Reset token đã hết hạn"}), 400
+
+    if record.get("token_hash") != _hash_reset_token(reset_token):
+        return jsonify({"success": False, "error": "Reset token không đúng"}), 401
+
+    collection_users.update_one(
+        {"username": username},
+        {"$set": {"pwd_sha256": new_password_hash, "updated_at": datetime.now()}}
+    )
+
+    collection_password_resets.update_one(
+        {"username": username},
+        {"$set": {"used": True, "used_at": datetime.now(), "updated_at": datetime.now()}}
     )
 
     return jsonify({"success": True, "username": username})
