@@ -80,15 +80,24 @@ def main():
     seed_intent("bật đèn phòng khách", "LIGHT1_ON")
     seed_intent("mở đèn phòng khách", "LIGHT1_ON")
     seed_intent("tắt đèn phòng khách", "LIGHT1_OFF")
+
+
     seed_intent("bật đèn phòng ngủ", "LIGHT2_ON")
     seed_intent("mở đèn phòng ngủ", "LIGHT2_ON")
     seed_intent("tắt đèn phòng ngủ", "LIGHT2_OFF")
+
+
     seed_intent("bật đèn phòng bếp", "LIGHT3_ON")
+    seed_intent("bật đèn nhà bếp", "LIGHT3_ON") 
     seed_intent("mở đèn phòng bếp", "LIGHT3_ON")
+    seed_intent("mở đèn nhà bếp", "LIGHT3_ON")
+    seed_intent("tắt đèn nhà bếp", "LIGHT3_OFF")     
     seed_intent("tắt đèn phòng bếp", "LIGHT3_OFF")
+
     seed_intent("bật quạt", "FAN_ON")
     seed_intent("mở quạt", "FAN_ON")
     seed_intent("tắt quạt", "FAN_OFF")
+    
     seed_intent("mở cửa", "DOOR_OPEN")
     seed_intent("đóng cửa", "DOOR_CLOSE")
     seed_intent("mở mái", "ROOF_OPEN")
