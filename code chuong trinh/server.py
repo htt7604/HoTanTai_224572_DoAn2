@@ -384,6 +384,12 @@ GAS_CHANGE_THRESHOLD = 50    # Gas thay đổi > 50
 GAS_ALERT_THRESHOLD = int(os.getenv("GAS_ALERT_THRESHOLD", "1200"))
 FCM_SERVER_KEY = os.getenv("FCM_SERVER_KEY", "").strip()
 FCM_SEND_URL = "https://fcm.googleapis.com/fcm/send"
+CONFIG_EVENTS_REQUIRE_ESP32 = frozenset({
+    "RFID_CARD_INITIALIZED",
+    "RFID_CARD_CHANGED",
+    "DOOR_PASSWORD_INITIALIZED",
+    "DOOR_PASSWORD_CHANGED"
+})
 
 # ===== BẮT ĐẦU CHỨC NĂNG HASH MẬT KHẨU =====
 PASSWORD_HASH_COLLECTION_CANDIDATES = [
@@ -461,6 +467,12 @@ def on_connect(client, userdata, flags, rc):
 
 def save_event(event_type, description, data=None):
     """Lưu sự kiện quan trọng vào MongoDB"""
+    if event_type in CONFIG_EVENTS_REQUIRE_ESP32:
+        esp32 = get_esp32_status()
+        if not esp32.get("connected", False):
+            print(f"[EVENT] Skip save {event_type} (ESP32 offline)")
+            return False
+
     event = {
         "timestamp": datetime.now(),
         "event_type": event_type,
@@ -469,6 +481,7 @@ def save_event(event_type, description, data=None):
     }
     collection_events.insert_one(event)
     print(f"[EVENT] {event_type}: {description}")
+    return True
 
 
 def _get_mobile_push_tokens():
@@ -755,6 +768,11 @@ def init_mqtt():
 
 def log_user_action(command, source, raw_text=None):
     """Lưu lịch sử hành động của người dùng vào MongoDB"""
+    esp32 = get_esp32_status()
+    if not esp32.get("connected", False):
+        print(f"[USER ACTION] Skip save (ESP32 offline): {command} (source={source})")
+        return False
+
     doc = {
         "timestamp": datetime.now(),
         "command": command,
@@ -764,6 +782,7 @@ def log_user_action(command, source, raw_text=None):
         doc["text"] = raw_text
     collection_user_actions.insert_one(doc)
     print(f"[USER ACTION] {command} (source={source})")
+    return True
 
 def voice_listen_once():
     """Nghe một lần từ microphone và trả về text."""
@@ -1183,6 +1202,10 @@ def get_rfid_card():
 
 @app.route("/rfid/card", methods=["POST"])
 def upsert_rfid_card():
+    offline_response = require_esp32_connection()
+    if offline_response:
+        return offline_response
+
     data = request.json or {}
     new_uid = _normalize_rfid_uid(data.get("new_uid"))
     old_uid = _normalize_rfid_uid(data.get("old_uid"))
@@ -1252,6 +1275,10 @@ def get_door_password_info():
 
 @app.route("/door-password", methods=["POST"])
 def update_door_password():
+    offline_response = require_esp32_connection()
+    if offline_response:
+        return offline_response
+
     data = request.json or {}
     old_hash = _resolve_password_hash(data, "old_password", "old_password_hash")
     new_hash = _resolve_password_hash(data, "new_password", "new_password_hash")
