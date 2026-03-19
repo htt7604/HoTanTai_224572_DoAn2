@@ -318,12 +318,7 @@ ai_engine = SmartHomeAI(db)
 
 # ================== FLASK ==================
 app = Flask(__name__, template_folder='templates')
-CORS(
-    app,
-    resources={r"/*": {"origins": "*"}},
-    allow_headers=["Content-Type", "Authorization", "X-Auth-Token"],
-    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
-)  # Cho phép web client độc lập (ví dụ GitHub Pages) gọi API
+CORS(app)  # Cho phép CORS để web app có thể gọi API
 app.secret_key = os.getenv("FLASK_SECRET_KEY", os.getenv("APP_SECRET_KEY", "change-this-in-production"))
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
