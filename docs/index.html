@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SmartHome GitHub Pages Client</title>
+  <style>
+    *{box-sizing:border-box}body{margin:0;font-family:Arial,sans-serif;background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh;padding:16px;color:#111}
+    .wrap{max-width:1000px;margin:0 auto}.card{background:#fff;border-radius:12px;padding:16px;margin-bottom:12px;box-shadow:0 4px 18px rgba(0,0,0,.12)}
+    h2,h3{margin:0 0 10px;color:#3b4fc4}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+    @media(max-width:760px){.row,.grid{grid-template-columns:1fr}}input,button{width:100%;padding:10px 12px;border-radius:8px;font-size:14px}
+    input{border:1px solid #d9d9d9}button{border:none;background:#5a6fda;color:#fff;font-weight:700;cursor:pointer}button:hover{background:#4a5fcf}
+    .danger{background:#d64545}.danger:hover{background:#bc3737}.muted{background:#667085}.muted:hover{background:#555f72}
+    .sensor{background:#f6f8ff;border:1px solid #e6ebff;border-radius:10px;padding:10px;text-align:center;font-weight:700;color:#2f3f92}
+    .status{margin-top:8px;background:#eef3ff;color:#1f3f8f;border-radius:8px;padding:10px;font-weight:600;word-break:break-word}
+    .hidden{display:none}.small{font-size:12px;color:#666}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h2>🌐 SmartHome Client (GitHub Pages)</h2>
+      <div class="row">
+        <input id="apiBase" value="https://hotantai.id.vn" placeholder="API Base URL" />
+        <button id="btnCheck">Kiểm tra kết nối API</button>
+      </div>
+      <div class="small" style="margin-top:6px">Client này chạy độc lập trên GitHub Pages, dùng Bearer token với API server.</div>
+      <div class="status" id="globalStatus">Sẵn sàng.</div>
+    </div>
+
+    <div class="card" id="loginCard">
+      <h3>🔐 Đăng nhập</h3>
+      <div class="row">
+        <input id="username" placeholder="Username" />
+        <input id="password" type="password" placeholder="Password" />
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button id="btnLogin">Đăng nhập</button>
+        <button id="btnRegister" class="muted">Đăng ký nhanh</button>
+      </div>
+      <div class="status" id="authStatus">Chưa đăng nhập.</div>
+    </div>
+
+    <div class="card hidden" id="dashCard">
+      <h3>🏠 Dashboard</h3>
+      <div class="row" style="margin-bottom:10px">
+        <input id="currentUser" disabled />
+        <button id="btnLogout" class="danger">Đăng xuất</button>
+      </div>
+
+      <div class="grid">
+        <div class="sensor" id="sTemp">Temp: --</div><div class="sensor" id="sHum">Hum: --</div><div class="sensor" id="sGas">Gas: --</div><div class="sensor" id="sRain">Rain: --</div>
+        <div class="sensor" id="sFlame">Flame: --</div><div class="sensor" id="sPir">PIR: --</div><div class="sensor" id="sDoor">Door: --</div><div class="sensor" id="sFan">Fan: --</div>
+      </div>
+
+      <div class="grid" style="margin-top:12px">
+        <button class="cmd" data-cmd="DOOR_OPEN">Mở cửa</button><button class="cmd" data-cmd="DOOR_CLOSE">Đóng cửa</button>
+        <button class="cmd" data-cmd="FAN_ON">Bật quạt</button><button class="cmd" data-cmd="FAN_OFF">Tắt quạt</button>
+        <button class="cmd" data-cmd="ROOF_OPEN">Mở mái</button><button class="cmd" data-cmd="ROOF_CLOSE">Đóng mái</button>
+        <button class="cmd" data-cmd="LIGHT1_ON">Bật đèn 1</button><button class="cmd" data-cmd="LIGHT1_OFF">Tắt đèn 1</button>
+        <button class="cmd" data-cmd="LIGHT2_ON">Bật đèn 2</button><button class="cmd" data-cmd="LIGHT2_OFF">Tắt đèn 2</button>
+        <button class="cmd" data-cmd="LIGHT3_ON">Bật đèn 3</button><button class="cmd" data-cmd="LIGHT3_OFF">Tắt đèn 3</button>
+      </div>
+
+      <div class="status" id="dashStatus">Đang chờ lệnh...</div>
+    </div>
+  </div>
+
+<script>
+const STORE={BASE:'smarthome_pages_base',TOKEN:'smarthome_pages_token',USER:'smarthome_pages_user'};
+const el={apiBase:apiBase,globalStatus,loginCard,dashCard,authStatus,dashStatus,username,password,currentUser,sTemp,sHum,sGas,sRain,sFlame,sPir,sDoor,sFan};
+let pollTimer=null;
+
+function normBase(v){const t=(v||'').trim().replace(/\/$/,'');return t||'https://hotantai.id.vn'}
+function getBase(){return normBase(el.apiBase.value)}
+function getToken(){return (localStorage.getItem(STORE.TOKEN)||'').trim()}
+function saveBase(){localStorage.setItem(STORE.BASE,getBase())}
+function setGlobal(m){el.globalStatus.textContent=m}
+function setAuth(m){el.authStatus.textContent=m}
+function setDash(m){el.dashStatus.textContent=m}
+
+async function api(path,opt={}){
+  const headers={'Content-Type':'application/json',...(opt.headers||{})};
+  const tk=getToken(); if(tk) headers.Authorization=`Bearer ${tk}`;
+  const res=await fetch(getBase()+path,{...opt,headers});
+  let data={}; try{data=await res.json()}catch(_){ }
+  return {res,data};
+}
+
+function showDash(user){el.loginCard.classList.add('hidden');el.dashCard.classList.remove('hidden');el.currentUser.value=`User: ${user}`;startPolling()}
+function showLogin(){el.dashCard.classList.add('hidden');el.loginCard.classList.remove('hidden');stopPolling()}
+
+async function checkApi(){saveBase();setGlobal('Đang kiểm tra API...');try{const res=await fetch(getBase()+'/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:'x',password:'x'})});setGlobal('API phản hồi: HTTP '+res.status)}catch(e){setGlobal('Không kết nối API: '+e.message)}}
+
+async function login(){
+  const u=(el.username.value||'').trim().toLowerCase();const p=el.password.value||'';
+  if(!u||!p){setAuth('Nhập username và password.');return}
+  setAuth('Đang đăng nhập...');
+  try{
+    const {res,data}=await api('/auth/login',{method:'POST',body:JSON.stringify({username:u,password:p})});
+    if(!res.ok||!data.success){setAuth(`Đăng nhập thất bại (${res.status}): ${data.error||'Unknown'}`);return}
+    if(!data.api_token){setAuth('Server chưa trả api_token.');return}
+    localStorage.setItem(STORE.TOKEN,data.api_token);localStorage.setItem(STORE.USER,u);setAuth('Đăng nhập thành công.');showDash(u)
+  }catch(e){setAuth('Lỗi kết nối: '+e.message)}
+}
+
+async function registerQuick(){
+  const u=(el.username.value||'').trim().toLowerCase();const p=el.password.value||'';
+  if(!u||!p){setAuth('Nhập username và password để đăng ký.');return}
+  setAuth('Đang đăng ký...');
+  try{const {res,data}=await api('/auth/register',{method:'POST',body:JSON.stringify({username:u,password:p})});
+    if(!res.ok||!data.success){setAuth(`Đăng ký thất bại (${res.status}): ${data.error||'Unknown'}`);return}
+    setAuth('Đăng ký thành công, bấm Đăng nhập.');
+  }catch(e){setAuth('Lỗi kết nối: '+e.message)}
+}
+
+function logout(){localStorage.removeItem(STORE.TOKEN);localStorage.removeItem(STORE.USER);showLogin();setDash('Đã đăng xuất.')}
+
+async function fetchSensor(){
+  try{
+    const {res,data}=await api('/sensor/latest');
+    if(res.status===401){setDash('Phiên hết hạn, đăng nhập lại.');logout();return}
+    if(!res.ok){setDash(`Lỗi sensor (${res.status}): ${data.error||''}`);return}
+    el.sTemp.textContent=`Temp: ${data.temp??'--'}°C`;el.sHum.textContent=`Hum: ${data.hum??'--'}%`;el.sGas.textContent=`Gas: ${data.gas??'--'}`;
+    el.sRain.textContent=`Rain: ${data.rain?'Có':'Không'}`;el.sFlame.textContent=`Flame: ${data.flame?'Có':'Không'}`;el.sPir.textContent=`PIR: ${data.pir?'Có':'Không'}`;
+    el.sDoor.textContent=`Door: ${data.door?'Mở':'Đóng'}`;el.sFan.textContent=`Fan: ${data.fan?'Bật':'Tắt'}`;
+    setDash(`Cập nhật: ${data.timestamp||new Date().toLocaleString()}`)
+  }catch(e){setDash('Lỗi kết nối sensor: '+e.message)}
+}
+
+async function sendCommand(cmd){
+  let path='';let body={};
+  if(cmd.startsWith('LIGHT')){const [a,b]=cmd.split('_');path='/control/light';body={light:parseInt(a.replace('LIGHT',''),10),state:b==='ON'}}
+  else if(cmd.startsWith('FAN_')){path='/control/fan';body={state:cmd.endsWith('ON')}}
+  else if(cmd.startsWith('ROOF_')){path='/control/roof';body={state:cmd.endsWith('OPEN')}}
+  else if(cmd.startsWith('DOOR_')){path='/control/door';body={action:cmd.endsWith('OPEN')?'OPEN':'CLOSE'}}
+  if(!path){setDash('Lệnh không hỗ trợ: '+cmd);return}
+  try{
+    const {res,data}=await api(path,{method:'POST',body:JSON.stringify(body)});
+    if(res.status===401){setDash('Phiên hết hạn, đăng nhập lại.');logout();return}
+    if(!res.ok){setDash(`Gửi lệnh thất bại (${res.status}): ${data.error||data.message||'Unknown'}`);return}
+    setDash('Đã gửi lệnh: '+cmd);fetchSensor();
+  }catch(e){setDash('Lỗi gửi lệnh: '+e.message)}
+}
+
+function startPolling(){stopPolling();fetchSensor();pollTimer=setInterval(fetchSensor,4000)}
+function stopPolling(){if(pollTimer){clearInterval(pollTimer);pollTimer=null}}
+
+btnCheck.onclick=checkApi;btnLogin.onclick=login;btnRegister.onclick=registerQuick;btnLogout.onclick=logout;
+document.querySelectorAll('.cmd').forEach(b=>b.onclick=()=>sendCommand(b.dataset.cmd));
+
+(function init(){const sb=localStorage.getItem(STORE.BASE);if(sb) el.apiBase.value=normBase(sb);const tk=getToken();const u=localStorage.getItem(STORE.USER)||'';if(tk&&u) showDash(u); else showLogin();})();
+</script>
+</body>
+</html>
