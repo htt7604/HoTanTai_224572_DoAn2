@@ -72,8 +72,8 @@ pip install -r requirements.txt
 
 - Dự án hỗ trợ MongoDB local hoặc MongoDB Atlas
 - Cấu hình qua `.env` trong thư mục `code chuong trinh`:
-   - `MONGO_URI=...`
-   - `MONGO_DB_NAME=iot_db`
+  - `MONGO_URI=...`
+  - `MONGO_DB_NAME=iot_db`
 
 #### 4. Cài đặt MQTT Broker
 
@@ -101,18 +101,10 @@ pip install -r requirements.txt
 2. Upload code lên ESP8266
 3. Kết nối ESP8266 với ESP32 qua Serial (GPIO 13, 14)
 
-### Server Python
+### Server Python (đã triển khai cloud)
 
-1. Tạo file `.env` trong thư mục `code chuong trinh` (nếu chưa có), tối thiểu gồm:
-   - `MQTT_USERNAME=...`
-   - `MQTT_PASSWORD=...`
-   - `MONGO_URI=...`
-   - `MONGO_DB_NAME=iot_db`
-2. Chạy server:
-   ```bash
-   python server.py
-   ```
-3. Mở trình duyệt: `http://localhost:5000`
+- Server đã chạy trên máy chủ cloud, không cần chạy `python server.py` trên máy cá nhân.
+- Truy cập trực tiếp web tại: `https://hotantai.id.vn`
 
 ## 🔐 Mật khẩu
 
@@ -123,6 +115,77 @@ pip install -r requirements.txt
 
 ## 🎮 Sử dụng
 
+## 👨‍🏫 Hướng dẫn sử dụng hệ thống cho thầy (demo nhanh)
+
+### 1) Chuẩn bị trước khi demo
+
+- Server đã được triển khai trên cloud.
+- Link truy cập web: `https://hotantai.id.vn`
+- Chỉ cần chuẩn bị:
+   - Trình duyệt web để demo.
+   - Điện thoại Android (nếu demo app APK).
+
+### 2) Chạy hệ thống
+
+#### Cách A - Demo có phần cứng thật (ESP32/ESP8266)
+
+1. Cấp nguồn ESP32 + ESP8266, kiểm tra đã kết nối WiFi/MQTT.
+2. Mở web tại: `https://hotantai.id.vn`
+
+#### Cách B - Demo không có phần cứng (dùng simulator)
+
+1. Mở terminal, chạy giả lập ESP32 để publish dữ liệu lên MQTT:
+   ```bash
+   cd "code chuong trinh"
+   python esp32_simulator.py
+   ```
+2. Mở web để theo dõi dữ liệu cảm biến/events: `https://hotantai.id.vn`
+
+### 3) Tài khoản đăng nhập demo
+
+- Đăng nhập web/app bằng **tài khoản và mật khẩu** đã tạo trong hệ thống.
+- Server tự tạo tài khoản mặc định nếu chưa có:
+  - `username: admin`
+  - `password: 123`
+
+### 4) Ứng dụng Android demo (APK)
+
+- Dự án có sẵn file APK để cài trực tiếp và demo trên điện thoại.
+- File APK: `APK Demo app/app-debug.apk`
+- Cách dùng nhanh:
+  1. Chép file APK vào điện thoại Android.
+  2. Cài đặt ứng dụng (cho phép cài từ nguồn ngoài nếu được yêu cầu).
+  3. Mở app và đăng nhập bằng tài khoản/mật khẩu của hệ thống.
+
+### 5) Luồng demo đề xuất cho buổi chấm
+
+1. **Đăng nhập** vào web/app bằng tài khoản `admin`.
+2. **Xem dữ liệu cảm biến realtime** ở màn hình chính.
+3. **Điều khiển thiết bị**: cửa, đèn, quạt, mái che.
+4. **Kiểm tra AI**:
+   - Gửi lệnh text/giọng nói (ví dụ: bật đèn phòng khách).
+   - Quan sát server publish lệnh MQTT và thiết bị đổi trạng thái.
+5. **Kiểm tra bảo mật cửa**:
+   - Quét RFID hợp lệ/không hợp lệ.
+   - Nhập mật khẩu cửa đúng/sai.
+6. **Xem lịch sử** tại trang history (sự kiện, cảnh báo, hành động người dùng).
+
+### 6) Điểm nhấn cần trình bày với thầy
+
+- Kiến trúc 3 lớp: **Thiết bị IoT ↔ Server Flask/MQTT ↔ Web/Mobile App**.
+- Cảnh báo an toàn: **lửa, gas, chuyển động** + push notification.
+- AI có khả năng:
+  - Dạy intent/alias/rule mới.
+  - Học từ lịch sử thao tác để tự tạo rule.
+  - Retrain mô hình intent theo dữ liệu mới.
+
+### 7) Xử lý nhanh lỗi thường gặp khi demo
+
+- Không có dữ liệu cảm biến: kiểm tra ESP32 hoặc chạy `esp32_simulator.py`.
+- Lỗi MQTT: kiểm tra `MQTT_USERNAME`, `MQTT_PASSWORD`, internet.
+- Lỗi MongoDB: kiểm tra `MONGO_URI`, trạng thái MongoDB Atlas/local.
+- Mở web không được: kiểm tra domain `https://hotantai.id.vn` và kết nối internet.
+
 ### Điều khiển qua Keypad
 
 - Nhập mật khẩu trên keypad và nhấn `#` để xác thực mở cửa
@@ -131,7 +194,7 @@ pip install -r requirements.txt
 
 ### Điều khiển qua Web App
 
-1. Mở trình duyệt: `http://localhost:5000`
+1. Mở trình duyệt: `https://hotantai.id.vn`
 2. Xem trạng thái tất cả cảm biến
 3. Điều khiển:
    - Cửa: Nhập mật khẩu và nhấn "Mở cửa"
@@ -171,15 +234,15 @@ ESP32 gửi UID RFID lên server để xác thực. Nếu hợp lệ, server pub
 
 ## 📡 MQTT Topics
 
-| Topic | Publish | Subscribe | Payload |
-|------|---------|-----------|---------|
-| `esp32/sensor` | ESP32 | Server | JSON cảm biến/trạng thái |
-| `esp32/events` | ESP32 | Server | JSON event |
-| `esp32/control` | Server | ESP32 | text command |
-| `esp32/password` | ESP32 | Server | JSON `{type, hash}` |
-| `esp32/password/result` | Server | ESP32 | `OK` / `FAIL` |
-| `esp32/rfid` | ESP32 | Server | JSON `{uid, source}` |
-| `esp32/rfid/result` | Server | ESP32 | JSON `{status, message, uid, auto_open}` |
+| Topic                     | Publish | Subscribe | Payload                                    |
+| ------------------------- | ------- | --------- | ------------------------------------------ |
+| `esp32/sensor`          | ESP32   | Server    | JSON cảm biến/trạng thái               |
+| `esp32/events`          | ESP32   | Server    | JSON event                                 |
+| `esp32/control`         | Server  | ESP32     | text command                               |
+| `esp32/password`        | ESP32   | Server    | JSON `{type, hash}`                      |
+| `esp32/password/result` | Server  | ESP32     | `OK` / `FAIL`                          |
+| `esp32/rfid`            | ESP32   | Server    | JSON `{uid, source}`                     |
+| `esp32/rfid/result`     | Server  | ESP32     | JSON `{status, message, uid, auto_open}` |
 
 Danh sách command/payload chi tiết xem thêm tại `code chuong trinh/SMARTHOME_SYSTEM_SPEC.md`.
 
@@ -209,13 +272,6 @@ HoTanTai_224572_DoAn2/
 │   └── So_do_noi_day_ESP32_ESP8266_CHUAN_CUOI.docx
 └── README.md
 ```
-
-## 🔗 Tài liệu tham khảo
-
-+ https://www.slideshare.net/slideshow/bo-co-n-tt-nghip-thit-k-nh-thng-minh/265010741
-+ https://www.slideshare.net/slideshow/luan-van-he-thong-iot-dieu-khien-va-giam-sat-ngoi-nha-hay-9d/207011713
-+ https://www.slideshare.net/slideshow/n-thit-k-ch-to-m-hinh-nh-thng-minh-s-dng-arduinodocx/256635836
-+ https://www.slideshare.net/slideshow/bo-co-n-chuyn-ngnh-thit-k-nh-thng-minhdocx/267101938
 
 ## 👤 Tác giả
 
