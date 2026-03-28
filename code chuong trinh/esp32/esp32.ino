@@ -11,8 +11,8 @@
 #include "mbedtls/sha256.h"
 
 // ================= CẤU HÌNH WIFI =================
-const char* ssid = "P3.15";
-const char* password = "namcanthoDNC";
+const char* ssid = "THU VIEN DNC";
+const char* password = "namcanthodnc";
 
 // ================= CẤU HÌNH MQTT =================
 const char* mqtt_server = "3c5308fe02794486932d547731382984.s1.eu.hivemq.cloud";
@@ -113,6 +113,13 @@ bool isDoorOpen = false;
 bool lastRainState = false;
 bool lastPirState = false;
 bool lastGasState = false;
+bool rainRawState = false;
+bool rainFilteredState = false;
+unsigned long rainLastRawChangeAt = 0;
+
+//độ nhạy cảm biến mưa
+const unsigned long RAIN_STABLE_MS = 1200;
+
 bool fanRunning = false;
 bool light1State = false;
 bool light2State = false;
@@ -146,6 +153,10 @@ unsigned long lastLcdUpdate = 0;
 unsigned long lastGasCheck = 0;
 unsigned long lastSensorPublish = 0;
 const unsigned long SENSOR_PUBLISH_INTERVAL = 2000; // 2 giây
+
+// ===== RFID WATCHDOG =====
+unsigned long lastRfidSeenAt = 0;
+const unsigned long RFID_REINIT_MS = 30000;
 
 // ===== CHỨC NĂNG BUZZER CẢNH BÁO =====
 void shortBeep(unsigned int ms = 150) {
@@ -244,6 +255,10 @@ void reconnectMQTT() {
       lcd.print("MQTT Connected!");
       delay(2000);
       lcd.clear();
+
+      // Re-init RFID in case SPI got stuck during disconnects.
+      SPI.begin();
+      rfid.PCD_Init();
     } else {
       Serial.print("failed, rc=");
       Serial.print(client.state());
@@ -558,13 +573,34 @@ bool readPirMotion() {
   return digitalRead(PIR_PIN) == PIR_ACTIVE_LEVEL;
 }
 
+bool readRainRaw() {
+  return digitalRead(RAIN_PIN) == LOW;
+}
+
+bool updateRainFilteredState() {
+  bool raw = readRainRaw();
+  unsigned long now = millis();
+
+  if (raw != rainRawState) {
+    rainRawState = raw;
+    rainLastRawChangeAt = now;
+  }
+
+  // Chỉ cập nhật trạng thái mưa khi tín hiệu giữ ổn định đủ lâu.
+  if (rainFilteredState != rainRawState && (now - rainLastRawChangeAt >= RAIN_STABLE_MS)) {
+    rainFilteredState = rainRawState;
+  }
+
+  return rainFilteredState;
+}
+
 void publishSensorData() {
   if (!client.connected()) {
     return;
   }
   
   // Đọc cảm biến
-  bool isRaining = (digitalRead(RAIN_PIN) == LOW);
+  bool isRaining = rainFilteredState;
   bool pirDetected = readPirMotion();
   bool isFire = (digitalRead(FLAME_PIN) == LOW);
   int gasValue = gasAverageValue;
@@ -616,6 +652,11 @@ void setup() {
   pinMode(FLAME_PIN, INPUT);
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(PIR_PIN, INPUT_PULLDOWN);
+
+  rainRawState = readRainRaw();
+  rainFilteredState = rainRawState;
+  lastRainState = rainFilteredState;
+  rainLastRawChangeAt = millis();
 
   SPI.begin();
   rfid.PCD_Init();
@@ -674,15 +715,45 @@ char readKeypad()
 }
 
 void loop() {
+  unsigned long now = millis();
+
+  // RFID server response timeout guard runs early to avoid being skipped by later blocking reconnects.
+  if (waitingRfidResult && rfidRequestAt > 0 && (now - rfidRequestAt > RFID_RESULT_TIMEOUT_MS)) {
+    waitingRfidResult = false;
+    rfidRequestAt = 0;
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("RFID TIMEOUT");
+    lcd.setCursor(0, 1);
+    lcd.print("TRY AGAIN");
+    delay(500);
+    lcd.clear();
+  }
+
+  // RFID self-recovery: if lâu không đọc được thẻ (không ở trạng thái chờ), reset chip.
+  if (!waitingRfidResult && lastRfidSeenAt > 0 && (now - lastRfidSeenAt > RFID_REINIT_MS)) {
+    SPI.begin();
+    rfid.PCD_Init();
+    lastRfidSeenAt = now;
+    Serial.println("RFID reinit (watchdog)");
+  }
+
   // Kiểm tra và reconnect MQTT nếu cần
   if (!client.connected()) {
+    // Avoid blocking RFID scans if network is down too long.
+    waitingRfidResult = false;
+    rfidRequestAt = 0;
     reconnectMQTT();
   }
   client.loop();
 
   // Kiểm tra WiFi
   if (WiFi.status() != WL_CONNECTED) {
+    waitingRfidResult = false;
+    rfidRequestAt = 0;
     connectWiFi();
+    SPI.begin();
+    rfid.PCD_Init();
   }
 
   // ===== ĐỌC DHT11 (>= 2 GIÂY / LẦN) =====
@@ -697,7 +768,7 @@ void loop() {
   }
 
   // ===== ĐỌC CẢM BIẾN KHÁC =====
-  bool isRaining   = (digitalRead(RAIN_PIN) == LOW);
+  bool isRaining   = updateRainFilteredState();
   bool pirDetected = readPirMotion();
   bool isFire      = (digitalRead(FLAME_PIN) == LOW);
   int  gasRawValue = analogRead(GAS_PIN);
@@ -827,6 +898,7 @@ void loop() {
 
     sendRfidUidToServer(uidHex);
     publishEvent("RFID_SCAN");
+    lastRfidSeenAt = now;
 
     rfid.PICC_HaltA();
     rfid.PCD_StopCrypto1();
@@ -968,6 +1040,28 @@ void displayLCD() {
     return;
   }
 
+  // Ưu tiên hiển thị cảnh báo liên tục khi có cháy hoặc gas.
+  bool fireActive = (digitalRead(FLAME_PIN) == LOW);
+  bool gasActive = lastGasState;
+
+  if (fireActive) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(">> FIRE ALERT! <<");
+    lcd.setCursor(0, 1);
+    lcd.print("Evacuate now    ");
+    return;
+  }
+
+  if (gasActive) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(">> GAS ALERT!  <<");
+    lcd.setCursor(0, 1);
+    lcd.print("Ventilation ON  ");
+    return;
+  }
+
   // Đổi trang mỗi 5 giây
   if (millis() - lastPageChange >= PAGE_CHANGE_INTERVAL) {
     displayPage = (displayPage + 1) % 3;
@@ -976,11 +1070,10 @@ void displayLCD() {
   }
 
   // Đọc cảm biến
-  bool isRaining = (digitalRead(RAIN_PIN) == LOW);
+  bool isRaining = rainFilteredState;
   bool pirDetected = readPirMotion();
-  bool isFire = (digitalRead(FLAME_PIN) == LOW);
   int gasValue = gasAverageValue;
-  bool gasDetected = (gasValue > GAS_ALERT_THRESHOLD);
+  bool gasDetected = gasActive; // bám theo trạng thái cảnh báo đã xác nhận
 
   switch (displayPage) {
     case 0: // Trang 1: Nhiệt độ & Độ ẩm
@@ -1008,10 +1101,8 @@ void displayLCD() {
 
     case 1: // Trang 2: Trạng thái cảm biến
       lcd.setCursor(0, 0);
-      if (isFire) {
-        lcd.print(">> FIRE ALERT! <<");
-      } else if (gasDetected) {
-        lcd.print(">> GAS DETECTED! ");
+      if (gasDetected) {
+        lcd.print("GAS WARNING    ");
       } else if (pirDetected) {
         lcd.print("MOTION DETECTED ");
       } else {
@@ -1036,7 +1127,7 @@ void displayLCD() {
       } else {
         lcd.print("WiFi: -- MQTT:--");
       }
-      if (isFire || gasDetected) {
+      if (fireActive || gasDetected) {
         lcd.setCursor(0, 1);
         lcd.print("WARNING ACTIVE!");
       }
